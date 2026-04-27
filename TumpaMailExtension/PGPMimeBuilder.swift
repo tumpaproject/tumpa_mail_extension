@@ -302,6 +302,64 @@ enum PGPMimeBuilder {
         return out
     }
 
+    /// Assemble a render-friendly RFC 822 message from an inbound
+    /// `multipart/encrypted` envelope + the decrypted inner MIME
+    /// part. The result has the outer envelope's routing headers
+    /// (From, To, Subject, Date, Message-Id, References, In-Reply-To,
+    /// etc.) followed by the decrypted inner part's Content-* headers
+    /// and body — i.e., what an unencrypted version of the same
+    /// message would look like on the wire.
+    ///
+    /// Why this exists: `MEDecodedMessage.data` is what Mail's reader
+    /// uses to lay out the message view AND what MFLibrary indexes
+    /// for full-text search. Handing it just the inner part (no
+    /// envelope) makes the body render empty in the reader and gives
+    /// the indexer no recipients/subject to record. The outbound
+    /// pre-cache solved this for messages we sent (cache `data` is
+    /// the original draft); inbound decrypt has to synthesize the
+    /// envelope from the encrypted message's outer headers.
+    ///
+    /// Drops outer Content-* and MIME-Version headers — the inner
+    /// part carries its own. Drops Apple-internal `X-Apple-*`. Keeps
+    /// everything else verbatim.
+    static func assembleInboundDecodedMessage(
+        envelopeSource: Data,
+        decryptedInnerPart: Data
+    ) throws -> Data {
+        let envelopeSplit = try splitHeadersAndBody(envelopeSource)
+        let innerSplit = try splitHeadersAndBody(decryptedInnerPart)
+        let eol = detectLineEnding(in: envelopeSource)
+
+        var out = Data()
+        // 1. Outer envelope routing headers — drop Content-* (those
+        //    describe the encrypted multipart wrapper, not the
+        //    decrypted entity) and MIME-Version (we re-emit one);
+        //    drop X-Apple-* compose-state.
+        for header in envelopeSplit.headers
+        where !isInnerHeader(name: header.name)
+            && header.name.lowercased() != "mime-version"
+            && !isAppleInternalHeader(name: header.name) {
+            appendHeader(into: &out, name: header.name, value: header.value, eol: eol)
+        }
+        // 2. Inner part's Content-* headers, lifted UP onto the
+        //    outer envelope. Without this lift, the assembled
+        //    message has two header blocks separated by a blank
+        //    line, and Mail's parser stops at the first blank line —
+        //    so the inner Content-Type / Content-Transfer-Encoding
+        //    lines render as literal body text in the message
+        //    viewer (observed 2026-04-27 with the naive "concat
+        //    envelope + inner-part-bytes" form).
+        for header in innerSplit.headers where isInnerHeader(name: header.name) {
+            appendHeader(into: &out, name: header.name, value: header.value, eol: eol)
+        }
+        appendHeader(into: &out, name: "MIME-Version", value: "1.0", eol: eol)
+
+        // 3. Single blank line, then the inner part's body.
+        out.append(eol)
+        out.append(innerSplit.body)
+        return out
+    }
+
     // MARK: - Header parsing / serialization
 
     struct ParsedHeader {

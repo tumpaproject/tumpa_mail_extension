@@ -418,8 +418,21 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 signingError: signingError,
                 encryptionError: nil
             )
+            // Hand Mail's reader a complete RFC 822 message — outer
+            // envelope (From/To/Subject/Date/...) from the encrypted
+            // wrapper plus the decrypted inner part. Returning just
+            // the inner part bytes makes the body render empty in
+            // Mail's viewer, since the reader uses `data` as a full
+            // message and looks up envelope metadata from its
+            // headers. Falls back to the raw plaintext if envelope
+            // assembly fails — better an inner-part-only render than
+            // nothing.
+            let assembled = (try? PGPMimeBuilder.assembleInboundDecodedMessage(
+                envelopeSource: original,
+                decryptedInnerPart: r.plaintext
+            )) ?? r.plaintext
             return MEDecodedMessage(
-                data: r.plaintext,
+                data: assembled,
                 securityInformation: secInfo,
                 context: secCtx
             )

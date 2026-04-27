@@ -239,3 +239,108 @@ final class PGPMimeBuilderHeaderValueTests: XCTestCase {
         )
     }
 }
+
+/// Tests for `PGPMimeBuilder.assembleInboundDecodedMessage`. This
+/// helper synthesizes a full RFC 822 message for Mail's reader from
+/// an inbound encrypted wrapper's outer envelope + the decrypted
+/// inner part. Without it, the inbound real-decrypt path returns
+/// inner-part-only `data` and the message body renders empty.
+final class PGPMimeBuilderInboundAssemblyTests: XCTestCase {
+
+    /// Outer envelope's routing headers are preserved; outer
+    /// Content-* and MIME-Version are dropped (the inner part
+    /// supplies its own); the decrypted inner part is appended after
+    /// a blank line.
+    func testAssembleInbound_KeepsEnvelopeDropsContentHeaders() throws {
+        let envelopeSource = Data("""
+            From: sender@example.com
+            To: kushal@civilized.systems
+            Subject: encrypted hello
+            Date: Mon, 27 Apr 2026 22:00:00 +0200
+            Message-Id: <abc@example.com>
+            MIME-Version: 1.0
+            Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="x"
+
+            --x
+            Content-Type: application/pgp-encrypted
+
+            Version: 1
+            --x
+            Content-Type: application/octet-stream
+
+            -----BEGIN PGP MESSAGE-----
+            (ciphertext)
+            -----END PGP MESSAGE-----
+            --x--
+            """.utf8)
+        let decryptedInner = Data("""
+            Content-Type: text/plain; charset=utf-8
+
+            Hello, decrypted!
+            """.utf8)
+
+        let assembled = try PGPMimeBuilder.assembleInboundDecodedMessage(
+            envelopeSource: envelopeSource,
+            decryptedInnerPart: decryptedInner
+        )
+        let s = String(data: assembled, encoding: .utf8)!
+        XCTAssertTrue(s.contains("From: sender@example.com"),
+                      "envelope From: must be preserved")
+        XCTAssertTrue(s.contains("Subject: encrypted hello"),
+                      "envelope Subject: must be preserved")
+        XCTAssertTrue(s.contains("Message-Id: <abc@example.com>"),
+                      "envelope Message-Id: must be preserved")
+        XCTAssertFalse(s.contains("multipart/encrypted"),
+                       "outer Content-Type must NOT appear in assembled output")
+        XCTAssertTrue(s.contains("Content-Type: text/plain; charset=utf-8"),
+                      "inner part Content-Type must be lifted up onto the outer envelope")
+        XCTAssertTrue(s.contains("Hello, decrypted!"),
+                      "inner part body must appear")
+        // Single header block: there should be exactly one blank
+        // line in the assembled output, between headers and body.
+        // Two blank lines means two header blocks, which is what
+        // caused the inner Content-* to render as literal body text.
+        let blanks = s.components(separatedBy: "\n\n").count - 1
+            + s.components(separatedBy: "\r\n\r\n").count - 1
+        XCTAssertEqual(blanks, 1,
+                       "exactly one header/body separator (got \(blanks)) — multiple means inner headers will leak into the body")
+    }
+
+    /// Envelope detection honors the outer message's line-ending
+    /// style. CRLF in equates to CRLF out for the assembled headers
+    /// — important because the assembled bytes get written into
+    /// Mail's library and a line-ending mix-up there could break
+    /// downstream consumers.
+    func testAssembleInbound_CRLFEnvelope_EmitsCRLFHeaders() throws {
+        let envelope = Data("From: a@example.com\r\nSubject: x\r\nMessage-Id: <m@x>\r\nContent-Type: multipart/encrypted\r\n\r\nbody".utf8)
+        let inner = Data("Content-Type: text/plain\r\n\r\nhi".utf8)
+        let assembled = try PGPMimeBuilder.assembleInboundDecodedMessage(
+            envelopeSource: envelope, decryptedInnerPart: inner
+        )
+        // Envelope headers section uses CRLF.
+        let s = String(data: assembled, encoding: .utf8)!
+        XCTAssertTrue(s.contains("From: a@example.com\r\n"),
+                      "CRLF envelope must produce CRLF assembled headers")
+    }
+
+    /// Apple-internal `X-Apple-*` headers from the outer envelope
+    /// don't leak into the assembled output (they're compose-state
+    /// from the sender's machine and irrelevant on inbound).
+    func testAssembleInbound_StripsAppleInternal() throws {
+        let envelope = Data("""
+            From: a@example.com
+            X-Apple-Auto-Saved: 1
+            Subject: y
+            Content-Type: multipart/encrypted
+
+            body
+            """.utf8)
+        let inner = Data("Content-Type: text/plain\n\nz".utf8)
+        let assembled = try PGPMimeBuilder.assembleInboundDecodedMessage(
+            envelopeSource: envelope, decryptedInnerPart: inner
+        )
+        let s = String(data: assembled, encoding: .utf8)!
+        XCTAssertFalse(s.contains("X-Apple-Auto-Saved"),
+                       "X-Apple-* headers from sender's compose state must not leak to inbound assembled view")
+    }
+}
