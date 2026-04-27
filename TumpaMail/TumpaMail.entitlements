@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	    Host app: sandboxed. The bundled XPC service is unsandboxed
+	    (where PCSC + tclig spawn + ~/.tumpa/agent.sock live), so
+	    the UI doesn't need ambient filesystem privileges itself —
+	    everything the UI wants from outside its container goes
+	    through XPC. Sandboxing is also what makes
+	    `com.apple.security.application-groups` auto-grant access
+	    to `~/Library/Group Containers/group.in.kushaldas.tumpamail/`;
+	    a NON-sandboxed app with this entitlement has to clear the
+	    macOS 14+ "Data from other apps" TCC dialog on every signed
+	    rebuild, which is what was happening before this flip.
+	    Apple Mail loads our .appex (which is sandboxed by Apple's
+	    runtime, not by us).
+
+	    Mail extensions don't need a special entitlement on the host —
+	    the .appex's `NSExtensionPointIdentifier` in Info.plist is
+	    what registers it with Mail (verified against Apple's own
+	    Mail Extension Xcode template).
+	-->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.in.kushaldas.tumpamail</string>
+	</array>
+</dict>
+</plist>

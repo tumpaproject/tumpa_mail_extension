@@ -1,0 +1,51 @@
+# XcodeGen output (regenerated from project.yml)
+TumpaMail.xcodeproj/
+*.xcworkspace/
+
+# Build outputs
+build/
+dist/
+DerivedData/
+
+# Per-user Xcode state
+xcuserdata/
+xcshareddata/
+
+# Test / coverage artifacts
+*.xcresult
+*.profraw
+*.profdata
+
+# Xcode internals
+*.hmap
+*.moved-aside
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+timeline.xctimeline
+playground.xcworkspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editor / OS scratch
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Swift packages (if we ever add SPM later)
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# Notarization scratch
+*.dmg
+*.zip
+notarization-*.json

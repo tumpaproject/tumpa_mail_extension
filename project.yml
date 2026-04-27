@@ -1,0 +1,181 @@
+# XcodeGen spec for Tumpa Mail.
+#
+# Generate the Xcode project with:
+#
+#     brew install xcodegen
+#     cd tumpa_mail_extension
+#     xcodegen generate
+#
+# This produces TumpaMail.xcodeproj. Open it in Xcode, set the
+# DEVELOPMENT_TEAM to your Developer ID team, then build / archive /
+# notarize via `scripts/build-dmg.sh`.
+#
+# Layout:
+#   TumpaMail.app/
+#     Contents/
+#       MacOS/TumpaMail               (host app — SwiftUI UI)
+#       XPCServices/TumpaCryptoXPC.xpc/
+#         Contents/MacOS/TumpaCryptoXPC   (the only place tclig is spawned)
+#       PlugIns/TumpaMailExtension.appex/
+#         Contents/MacOS/TumpaMailExtension   (sandboxed MailKit handler)
+
+name: TumpaMail
+options:
+  bundleIdPrefix: in.kushaldas.tumpamail
+  deploymentTarget:
+    macOS: "13.0"
+  developmentLanguage: en
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    GENERATE_INFOPLIST_FILE: NO
+    PRODUCT_BUNDLE_IDENTIFIER: $(inherited)
+    ENABLE_HARDENED_RUNTIME: YES
+    # Automatic signing with the team baked in: every `xcodegen
+    # generate` reproduces a signable project without the user having
+    # to re-pick Team in Xcode each time. Override with
+    # `DEVELOPMENT_TEAM=YOURID xcodebuild ...` for CI.
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: A7WGUTKMK6
+
+targets:
+
+  # ---------------------------------------------------------------
+  # Host app — the .app the user drags into /Applications. Owns the
+  # SwiftUI UI; embeds the XPC service and the .appex.
+  # ---------------------------------------------------------------
+  TumpaMail:
+    type: application
+    platform: macOS
+    sources:
+      - TumpaMail
+      - path: Shared
+        type: group
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: in.kushaldas.tumpamail
+        CODE_SIGN_ENTITLEMENTS: TumpaMail/TumpaMail.entitlements
+        INFOPLIST_FILE: TumpaMail/Info.plist
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../XPCServices"
+    dependencies:
+      - target: TumpaCryptoXPC
+        embed: true
+        codeSign: true
+      - target: TumpaMailExtension
+        embed: true
+        codeSign: true
+    # XcodeGen's `Destination` enum doesn't have an `xpc` case (only
+    # frameworks / plugins / etc.), so we move the embedded
+    # TumpaCryptoXPC.xpc bundle into Contents/XPCServices/ as a
+    # post-build step. The file `embed: true` puts it in is
+    # Frameworks/ by default; we rehome it to where `serviceName:`
+    # lookups expect it.
+    postBuildScripts:
+      - name: "Rehome TumpaCryptoXPC into Contents/XPCServices and copy into the .appex"
+        # The script's "output" is dependent on PRODUCT_NAME and we run
+        # it every build (the XPC bundle is rebuilt unconditionally),
+        # so opt out of dependency analysis instead of declaring outputs.
+        alwaysOutOfDate: true
+        script: |
+          set -euo pipefail
+          APP="${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app"
+          XPC_NAME="TumpaCryptoXPC.xpc"
+          SRC="${APP}/Contents/Frameworks/${XPC_NAME}"
+          HOST_DST="${APP}/Contents/XPCServices"
+          # `NSXPCConnection(serviceName:)` lookup is per-bundle: the
+          # .appex looks for the service inside its own
+          # Contents/XPCServices/ first, NOT inside the host. Without
+          # a copy in the .appex, the .appex's connect call hangs
+          # forever (no error path triggered).
+          APPEX_DST="${APP}/Contents/PlugIns/TumpaMailExtension.appex/Contents/XPCServices"
+          if [ -d "${SRC}" ]; then
+              mkdir -p "${HOST_DST}"
+              rm -rf "${HOST_DST}/${XPC_NAME}"
+              mv "${SRC}" "${HOST_DST}/${XPC_NAME}"
+              echo "Moved ${XPC_NAME} into Contents/XPCServices/"
+          fi
+          if [ -d "${HOST_DST}/${XPC_NAME}" ]; then
+              mkdir -p "${APPEX_DST}"
+              rm -rf "${APPEX_DST}/${XPC_NAME}"
+              # ditto preserves code-signing metadata exactly,
+              # including the nested .xpc bundle's
+              # `_CodeSignature/CodeResources` and entitlements
+              # (sandbox=false). After the copy the .appex's seal is
+              # stale (its CodeResources hashes don't reference the
+              # newly-nested .xpc), so we re-seal the .appex top
+              # level — but WITHOUT `--deep`. Using `--deep` would
+              # re-sign the inner XPC service with the .appex's
+              # entitlements (sandbox=true), which would silently
+              # break the XPC service's ability to spawn `tclig` or
+              # touch `~/.tumpa/agent.sock`.
+              ditto "${HOST_DST}/${XPC_NAME}" "${APPEX_DST}/${XPC_NAME}"
+              echo "Copied ${XPC_NAME} into the .appex's XPCServices/"
+              IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:-${CODE_SIGN_IDENTITY:--}}"
+              codesign --force --sign "${IDENTITY}" \
+                       --options runtime \
+                       --entitlements "${SRCROOT}/TumpaMailExtension/TumpaMailExtension.entitlements" \
+                       "${APP}/Contents/PlugIns/TumpaMailExtension.appex" 2>&1 || true
+              echo "=== embedded XPC service entitlements after rebuild ==="
+              codesign -d --entitlements - --xml "${APPEX_DST}/${XPC_NAME}" 2>&1 | head -40 || true
+          fi
+
+  # ---------------------------------------------------------------
+  # XPC Service Bundle — unsandboxed, spawns tclig. Both the host UI
+  # and the .appex connect to it via NSXPCConnection(serviceName:).
+  # ---------------------------------------------------------------
+  TumpaCryptoXPC:
+    type: xpc-service
+    platform: macOS
+    sources:
+      - TumpaCryptoXPC
+      - path: Shared
+        type: group
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: in.kushaldas.tumpamail.crypto
+        CODE_SIGN_ENTITLEMENTS: TumpaCryptoXPC/TumpaCryptoXPC.entitlements
+        INFOPLIST_FILE: TumpaCryptoXPC/Info.plist
+        ENABLE_APP_SANDBOX: NO
+
+  # ---------------------------------------------------------------
+  # MailKit extension (.appex). Sandboxed by Apple's MailKit runtime;
+  # all crypto goes via XPC to TumpaCryptoXPC.
+  # ---------------------------------------------------------------
+  TumpaMailExtension:
+    type: app-extension
+    platform: macOS
+    sources:
+      - TumpaMailExtension
+      - path: Shared
+        type: group
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: in.kushaldas.tumpamail.extension
+        CODE_SIGN_ENTITLEMENTS: TumpaMailExtension/TumpaMailExtension.entitlements
+        INFOPLIST_FILE: TumpaMailExtension/Info.plist
+        WRAPPER_EXTENSION: appex
+        ENABLE_APP_SANDBOX: YES
+    frameworks:
+      - MailKit.framework
+
+  # ---------------------------------------------------------------
+  # Unit tests for PGP/MIME framing logic. Compiles PGPMimeBuilder.swift
+  # directly into the test bundle (it's pure Foundation, no MailKit
+  # deps), so we can assert on `buildSignedMessage` byte output without
+  # needing Mail.app or the .appex runtime.
+  # ---------------------------------------------------------------
+  TumpaMailTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+      - path: TumpaMailExtension/PGPMimeBuilder.swift
+      - path: TumpaMailExtension/PGPMimeParser.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: in.kushaldas.tumpamail.tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic

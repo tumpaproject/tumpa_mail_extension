@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	    The .appex MUST stay sandboxed (Apple's MailKit runtime
+	    enforces this; verified against Apple's own Mail Extension
+	    Xcode template which sets ENABLE_APP_SANDBOX = YES).
+
+	    Mail extensions DO NOT use a separate entitlement to register
+	    with Mail — the registration mechanism is purely via
+	    `NSExtensionPointIdentifier = com.apple.mail.extension` in
+	    Info.plist. Earlier revisions of this file had a phantom
+	    `com.apple.developer.mail.mail-extensions` key that breaks
+	    signing; it's gone now.
+
+	    All actual crypto goes via NSXPCConnection to the embedded
+	    TumpaCryptoXPC service, which is unsandboxed and runs in the
+	    host bundle. The application-groups entry shares preferences
+	    (default signer, preferred digest) with the host UI.
+	-->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.in.kushaldas.tumpamail</string>
+	</array>
+</dict>
+</plist>
