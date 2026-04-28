@@ -59,6 +59,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: in.kushaldas.tumpamail
         CODE_SIGN_ENTITLEMENTS: TumpaMail/TumpaMail.entitlements
         INFOPLIST_FILE: TumpaMail/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../XPCServices"
     dependencies:
       - target: TumpaCryptoXPC
@@ -157,6 +158,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: TumpaMailExtension/TumpaMailExtension.entitlements
         INFOPLIST_FILE: TumpaMailExtension/Info.plist
         WRAPPER_EXTENSION: appex
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        COMBINE_HIDPI_IMAGES: YES
         ENABLE_APP_SANDBOX: YES
     frameworks:
       - MailKit.framework
@@ -174,6 +177,8 @@ targets:
       - path: Tests
       - path: TumpaMailExtension/PGPMimeBuilder.swift
       - path: TumpaMailExtension/PGPMimeParser.swift
+      - path: TumpaCryptoXPC/StatusLineParser.swift
+      - path: Shared/TumpaCryptoXPC.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: in.kushaldas.tumpamail.tests

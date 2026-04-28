@@ -196,17 +196,18 @@ final class XPCClient {
     ) async throws -> (
         status: String,
         signerFingerprint: String?,
+        signerKeyId: String?,
         signerUid: String?
     ) {
         try await call { proxy, cont in
             proxy.verifyDetached(
                 signedBytes: signedBytes,
                 armoredSignature: signature
-            ) { status, fp, uid, e in
+            ) { status, fp, kid, uid, e in
                 if let e = e {
                     cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
                 } else {
-                    cont.resume(returning: (status, fp, uid))
+                    cont.resume(returning: (status, fp, kid, uid))
                 }
             }
         }

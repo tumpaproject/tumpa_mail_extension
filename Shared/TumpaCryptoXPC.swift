@@ -102,11 +102,18 @@ public protocol TumpaCryptoXPC {
 
     /// Verify a detached signature over `signedBytes` (already
     /// CRLF-canonicalized by the caller per RFC 3156).
+    ///
+    /// `signerFingerprint` is the 40-char OpenPGP fingerprint parsed
+    /// from `[GNUPG:] VALIDSIG`; `signerKeyId` is the 16-char trailing
+    /// key ID parsed from `[GNUPG:] GOODSIG / BADSIG / NO_PUBKEY`. Both
+    /// can be present together on a successful verify; the caller's
+    /// popover prefers the fingerprint and falls back to the key ID.
     func verifyDetached(
         signedBytes: Data,
         armoredSignature: Data,
         reply: @escaping (_ status: String,
                           _ signerFingerprint: String?,
+                          _ signerKeyId: String?,
                           _ signerUid: String?,
                           _ error: NSError?) -> Void
     )

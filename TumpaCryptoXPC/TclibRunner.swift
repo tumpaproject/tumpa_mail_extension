@@ -224,7 +224,19 @@ public final class TclibRunner {
         /// One of "unsigned" / "good" / "bad" / "unknown" — matches
         /// `TumpaSignatureStatus`.
         public let signatureStatus: String
+        /// 40-char OpenPGP fingerprint of the inner-signature signer.
+        ///
+        /// Always `nil` for the `--decrypt --verify-decrypt` path:
+        /// tclig (>= 0.5.0, PR #23) deliberately emits only a 16-char
+        /// key ID on its `[GNUPG:] GOODSIG / BADSIG / NO_PUBKEY` lines
+        /// for the decrypt+verify path — no `VALIDSIG` is produced
+        /// because the inner signature carries only a key ID, not a
+        /// full fingerprint. Use `signerKeyId` for display; if the UI
+        /// needs a full fingerprint it must do its own keystore
+        /// lookup against this key ID.
         public let signerFingerprint: String?
+        /// 16-char trailing key ID. Populated for good / bad / unknown
+        /// signatures alike.
         public let signerKeyId: String?
         public let signerUid: String?
     }
@@ -238,6 +250,12 @@ public final class TclibRunner {
         try ciphertext.write(to: inURL)
         defer { try? FileManager.default.removeItem(at: inURL) }
 
+        // tclig (>= 0.5.0) writes ALL `[GNUPG:]` status lines
+        // (DECRYPTION_OKAY / GOODSIG / BADSIG / NO_PUBKEY) for the
+        // decrypt+verify path to STDERR. The plaintext goes to STDOUT.
+        // Parsing only stderr keeps `[GNUPG:]`-shaped sequences that
+        // happen to appear inside an attacker-controlled plaintext
+        // from being mis-classified as status lines.
         let result = try run(
             args: ["--decrypt", "--verify-decrypt", inURL.path],
             stdin: nil
@@ -255,11 +273,20 @@ public final class TclibRunner {
             status = TumpaSignatureStatus.unsigned
         }
 
+        // No VALIDSIG on this path → no 40-char fingerprint available.
+        // Funnel all three "we have a 16-char key ID" cases (good /
+        // bad / unknown) through `signerKeyId` so the SecurityDetailView
+        // displays them as "Key ID: …" rather than mislabeling them
+        // as a fingerprint.
+        let keyId = parsed.goodsigFingerprint
+            ?? parsed.badsigFingerprint
+            ?? parsed.noPubKeyId
+
         return DecryptVerifyOutput(
             plaintext: result.stdout,
             signatureStatus: status,
-            signerFingerprint: parsed.goodsigFingerprint ?? parsed.badsigFingerprint,
-            signerKeyId: parsed.noPubKeyId,
+            signerFingerprint: nil,
+            signerKeyId: keyId,
             signerUid: parsed.signerUid
         )
     }
@@ -268,7 +295,14 @@ public final class TclibRunner {
 
     public struct VerifyDetachedOutput {
         public let status: String
+        /// 40-char OpenPGP fingerprint, parsed from `[GNUPG:] VALIDSIG <fp>`.
+        /// Nil on BADSIG / NO_PUBKEY (where VALIDSIG is not emitted) and
+        /// on older tclig builds.
         public let signerFingerprint: String?
+        /// 16-char trailing key ID, parsed from `[GNUPG:] GOODSIG <kid>`
+        /// or BADSIG / NO_PUBKEY. Always populated when tclig emitted a
+        /// signature line, even for bad / unknown-signer outcomes.
+        public let signerKeyId: String?
         public let signerUid: String?
     }
 
@@ -288,12 +322,15 @@ public final class TclibRunner {
             stdin: signedBytes,
             allowNonZeroExit: true
         )
-        // tclig is inconsistent about which pipe it writes the
-        // `[GNUPG:]` status lines to: signing writes SIG_CREATED to
-        // stderr, but `--verify` writes GOODSIG / BADSIG / NO_PUBKEY
-        // to stdout (with the human-friendly "tcli: Good signature…"
-        // text on stderr). Parse both so we don't lose the signer
-        // fingerprint and UID on a successful verify.
+        // tclig (>= 0.5.0) writes the `[GNUPG:] GOODSIG / VALIDSIG /
+        // TRUST_FULLY` status block to STDOUT for the detached-verify
+        // path (verified by direct invocation: stdout carries the
+        // status, stderr carries the human-readable "tcli: Good
+        // signature from …" line). This is intentionally different
+        // from the sign / decrypt+verify paths, which use stderr —
+        // tclig matches GnuPG's own pipe assignments here for
+        // git-gpg-interface compatibility. Parse both pipes so the
+        // human stderr line on bad-signature exit doesn't get lost.
         let parsed = StatusLineParser.parse(result.stdout + result.stderr)
         let status: String
         if parsed.goodsigFingerprint != nil {
@@ -311,7 +348,15 @@ public final class TclibRunner {
         }
         return VerifyDetachedOutput(
             status: status,
-            signerFingerprint: parsed.goodsigFingerprint ?? parsed.badsigFingerprint,
+            // VALIDSIG carries the full 40-char fingerprint and is the
+            // authoritative signer identifier; only present on GOODSIG.
+            signerFingerprint: parsed.validsigFingerprint,
+            // GOODSIG / BADSIG / NO_PUBKEY all carry a 16-char trailing
+            // key ID. Use any of them so a bad signature still surfaces
+            // *which* key signed it, not just "bad".
+            signerKeyId: parsed.goodsigFingerprint
+                ?? parsed.badsigFingerprint
+                ?? parsed.noPubKeyId,
             signerUid: parsed.signerUid
         )
     }

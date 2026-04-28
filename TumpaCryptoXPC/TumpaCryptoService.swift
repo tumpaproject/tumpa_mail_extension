@@ -130,7 +130,7 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
     func verifyDetached(
         signedBytes: Data,
         armoredSignature: Data,
-        reply: @escaping (String, String?, String?, NSError?) -> Void
+        reply: @escaping (String, String?, String?, String?, NSError?) -> Void
     ) {
         workQueue.async {
             do {
@@ -138,9 +138,9 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
                     signedBytes: signedBytes,
                     signature: armoredSignature
                 )
-                reply(out.status, out.signerFingerprint, out.signerUid, nil)
+                reply(out.status, out.signerFingerprint, out.signerKeyId, out.signerUid, nil)
             } catch {
-                reply(TumpaSignatureStatus.unknown, nil, nil, Self.nsError(error))
+                reply(TumpaSignatureStatus.unknown, nil, nil, nil, Self.nsError(error))
             }
         }
     }

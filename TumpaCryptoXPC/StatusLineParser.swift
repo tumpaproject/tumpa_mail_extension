@@ -1,16 +1,42 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Thin parser for the `[GNUPG:]` status lines `tclig` writes to stderr.
+// Thin parser for the `[GNUPG:]` status lines `tclig` writes.
+//
+// As of tumpa-cli 0.5.0 (PR #23), tclig's emission rules are:
+//
+//   --detach-sign:  SIG_CREATED on stderr (omitted when libtumpa
+//                   reports a hash that's not in the OpenPGP-registered
+//                   set — caller falls back rather than emitting
+//                   `hash_algo=0`, which PGP/MIME `micalg` would reject).
+//   --clearsign / --sign (inline-opaque):  NO SIG_CREATED line. The
+//                   underlying primitives don't surface the hash, so
+//                   tclig deliberately suppresses the line rather
+//                   than lying with a hard-coded SHA-256 ID.
+//   --verify (detached):  GOODSIG / VALIDSIG / TRUST_FULLY on STDOUT.
+//                   GOODSIG carries a 16-char key ID; VALIDSIG carries
+//                   the full 40-char fingerprint.
+//   --decrypt --verify-decrypt:  DECRYPTION_OKAY then GOODSIG / BADSIG
+//                   / NO_PUBKEY on STDERR (status fd). No VALIDSIG —
+//                   the inner-sig path uses 16-char key IDs only.
+//   --encrypt:  INV_RECP per failed recipient on stderr.
+//
 // The lines we care about for the Mail extension are:
 //
 //   [GNUPG:] SIG_CREATED <type> <pk_algo> <hash_algo> <class> <ts> <fpr>
 //       Sign success. We pull <hash_algo> for the multipart/signed
 //       `micalg` parameter and <fpr> for the signer.
-//   [GNUPG:] GOODSIG <fingerprint> <uid…>
-//   [GNUPG:] BADSIG  <fingerprint> <uid…>
-//       Inner-signature verify result from `--decrypt --verify-decrypt`.
+//   [GNUPG:] GOODSIG <key_id> <uid…>
+//   [GNUPG:] BADSIG  <key_id> <uid…>
+//       Verify result. tclig emits a 16-char trailing key ID (matches
+//       GnuPG and git's gpg-interface). For the full 40-char form, see
+//       VALIDSIG below.
+//   [GNUPG:] VALIDSIG <fingerprint>
+//       Detached-verify only (--verify path). Carries the full 40-char
+//       fingerprint of the signing key. Prefer this over GOODSIG's
+//       <key_id> when populating `MEMessageSigner` / the security
+//       popover so users see a fingerprint, not a truncated key ID.
 //   [GNUPG:] NO_PUBKEY <key_id>
-//       Inner signature present, signer not in keystore.
+//       Signature present, signer not in keystore.
 //   [GNUPG:] DECRYPTION_OKAY
 //       Confirms the decrypt phase itself succeeded.
 //   [GNUPG:] INV_RECP 0 <recipient>
@@ -28,8 +54,17 @@ struct StatusLines {
     var sigCreatedHash: String?
     var sigCreatedFingerprint: String?
 
+    /// 16-char key ID parsed from GOODSIG / BADSIG. This is what tclig
+    /// emits on the GOODSIG line itself (matches GnuPG / git). For the
+    /// full 40-char fingerprint on the detached-verify path, see
+    /// `validsigFingerprint`.
     var goodsigFingerprint: String?
     var badsigFingerprint: String?
+    /// 40-char fingerprint parsed from `[GNUPG:] VALIDSIG <fp>`.
+    /// Emitted by `tclig --verify` (detached path) only; the
+    /// `--decrypt --verify-decrypt` path does not emit VALIDSIG, so
+    /// callers there fall back to `goodsigFingerprint`'s 16-char ID.
+    var validsigFingerprint: String?
     var noPubKeyId: String?
     /// UID portion of GOODSIG / BADSIG, if present.
     var signerUid: String?
@@ -81,6 +116,21 @@ enum StatusLineParser {
                 }
                 if parts.count >= 3 {
                     out.signerUid = parts.dropFirst(2).joined(separator: " ")
+                }
+
+            case "VALIDSIG":
+                // Format: VALIDSIG <fingerprint> [<sig_creation_date>
+                // <sig_ts> <expire_ts> <version> <reserved> <pk_algo>
+                // <hash_algo> <sig_class> <primary_fpr>]
+                // We only need <fingerprint> (column 1). Validate it
+                // looks like a 40-char hex fingerprint; reject anything
+                // shorter/longer rather than letting a malformed line
+                // poison the popover.
+                if parts.count >= 2 {
+                    let fp = parts[1]
+                    if fp.count == 40, fp.allSatisfy({ $0.isHexDigit }) {
+                        out.validsigFingerprint = fp.uppercased()
+                    }
                 }
 
             case "NO_PUBKEY":

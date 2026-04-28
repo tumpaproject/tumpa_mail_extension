@@ -9,6 +9,10 @@ import SwiftUI
 @main
 struct TumpaMailApp: App {
 
+    init() {
+        MailExtensionRegistration.refresh()
+    }
+
     var body: some Scene {
         WindowGroup("Tumpa Mail") {
             RootView()

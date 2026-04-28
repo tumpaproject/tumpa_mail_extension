@@ -8,6 +8,8 @@
 	<string>Tumpa Mail</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CFBundleInfoDictionaryVersion</key>
@@ -17,9 +19,9 @@
 	<key>CFBundlePackageType</key>
 	<string>XPC!</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.0.1</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<!--
@@ -47,13 +49,16 @@
 		<string>$(PRODUCT_MODULE_NAME).TumpaMailExtension</string>
 		<key>NSExtensionAttributes</key>
 		<dict>
+			<key>MEMessageSecurity</key>
+			<dict>
+				<key>MEMessageSecurityIcon</key>
+				<string>ShieldIcon</string>
+			</dict>
 			<key>MEExtensionCapabilities</key>
 			<array>
 				<string>MEMessageSecurityHandler</string>
 			</array>
 		</dict>
-		<key>MEComposeIconName</key>
-		<string>NSLockLockedTemplate</string>
 	</dict>
 </dict>
 </plist>

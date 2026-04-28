@@ -439,9 +439,14 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 }
                 if case .success(let v) = verify {
                     signatureStatus = v.status
+                    // `verifyDetached` populates `signerFingerprint`
+                    // from VALIDSIG (40-char) and `signerKeyId` from
+                    // GOODSIG (16-char). Both can be present on a
+                    // good verify; the popover prefers the fingerprint
+                    // and falls back to the key ID.
                     signerFp = v.signerFingerprint
                     signerUid = v.signerUid
-                    signerKid = nil
+                    signerKid = v.signerKeyId
                     // Use the SIGNED ENTITY (inner MIME part) as the
                     // assembled body — we don't want the multipart/signed
                     // wrapper to render in Mail's viewer; the signature
@@ -497,7 +502,12 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             return MEDecodedMessage(
                 data: assembled,
                 securityInformation: secInfo,
-                context: secCtx
+                context: secCtx,
+                banner: securityBanner(
+                    isEncrypted: true,
+                    signatureStatus: signatureStatus,
+                    errorMessage: nil
+                )
             )
         case .failure(let err):
             let secCtx = TumpaSecurityContext.encode(.init(
@@ -515,7 +525,12 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             return MEDecodedMessage(
                 data: original,
                 securityInformation: secInfo,
-                context: secCtx
+                context: secCtx,
+                banner: securityBanner(
+                    isEncrypted: true,
+                    signatureStatus: TumpaSignatureStatus.unsigned,
+                    errorMessage: err.localizedDescription
+                )
             )
         }
     }
@@ -566,7 +581,12 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             return MEDecodedMessage(
                 data: original,
                 securityInformation: secInfo,
-                context: secCtx
+                context: secCtx,
+                banner: securityBanner(
+                    isEncrypted: false,
+                    signatureStatus: r.status,
+                    errorMessage: nil
+                )
             )
         case .failure(let err):
             let secCtx = TumpaSecurityContext.encode(.init(
@@ -584,7 +604,12 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             return MEDecodedMessage(
                 data: original,
                 securityInformation: secInfo,
-                context: secCtx
+                context: secCtx,
+                banner: securityBanner(
+                    isEncrypted: false,
+                    signatureStatus: TumpaSignatureStatus.bad,
+                    errorMessage: err.localizedDescription
+                )
             )
         }
     }
@@ -628,14 +653,40 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 return isEncrypted ? .encrypted : .signedUnknown
             }
         }()
-        return TumpaSecurityContext.encode(.init(
+        let ctx = TumpaSecurityContext(
             status: status,
             signerEmail: email,
             signerLabel: label,
             fingerprint: fingerprint,
             keyId: keyId,
             errorMessage: errorMessage
-        ))
+        )
+        return TumpaSecurityContext.encode(ctx)
+    }
+
+    private func securityBanner(
+        isEncrypted: Bool,
+        signatureStatus: String,
+        errorMessage: String?
+    ) -> MEDecodedMessageBanner {
+        let title: String
+        if errorMessage != nil {
+            title = isEncrypted ? "Tumpa Mail could not decrypt this message" : "Tumpa Mail could not verify this message"
+        } else if isEncrypted && signatureStatus == TumpaSignatureStatus.good {
+            title = "Tumpa Mail decrypted and verified this message"
+        } else if isEncrypted {
+            title = "Tumpa Mail decrypted this message"
+        } else if signatureStatus == TumpaSignatureStatus.good {
+            title = "Tumpa Mail verified this message"
+        } else {
+            title = "Tumpa Mail checked this message"
+        }
+
+        return MEDecodedMessageBanner(
+            title: title,
+            primaryActionTitle: "Details",
+            dismissable: true
+        )
     }
 
     /// Build an `MEMessageSigner` array from XPC-returned fingerprint /
@@ -985,7 +1036,12 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         return MEDecodedMessage(
             data: data,
             securityInformation: secInfo,
-            context: secCtx
+            context: secCtx,
+            banner: securityBanner(
+                isEncrypted: isEncrypted,
+                signatureStatus: status,
+                errorMessage: nil
+            )
         )
     }
 
