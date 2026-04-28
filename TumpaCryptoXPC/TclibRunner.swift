@@ -191,10 +191,14 @@ public final class TclibRunner {
             // Sign-then-encrypt single-pass: produces an OpenPGP
             // message with a one-pass signature + literal + signature
             // packets, equivalent to `gpg --sign --encrypt`. tclig
-            // routes this to wecanencrypt::sign_and_encrypt_to_multiple
-            // when both --encrypt and -u are present. Software-key
-            // only at this layer (card-backed sign+encrypt is not
-            // yet wired through libtumpa).
+            // does card-first dispatch on the signing leg: when the
+            // signer's key has a matching connected card, the inner
+            // signature is produced on the card via
+            // `wecanencrypt::card::sign_and_encrypt_to_multiple_on_card`;
+            // otherwise tclig falls back to the software secret key
+            // (with passphrase via pinentry). The XPC reply shape is
+            // unchanged either way — the .appex doesn't observe which
+            // backend produced the signature.
             args.append(contentsOf: ["--sign", "-u", s])
         }
 

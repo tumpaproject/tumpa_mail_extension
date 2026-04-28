@@ -47,6 +47,11 @@ public protocol TumpaCryptoXPC {
     /// Encrypt `plaintext` to `recipientFingerprints`, optionally signing
     /// with `signerFingerprint` (the sign-then-encrypt path).
     ///
+    /// When `signerFingerprint` is non-nil and the signer's key has a
+    /// matching connected OpenPGP card, the inner signature is produced
+    /// on the card; otherwise the software secret key is used (with
+    /// passphrase via pinentry). Same reply shape for both backends.
+    ///
     /// On per-recipient resolution failure the reply carries the
     /// invalid recipient identifiers in `invalidRecipients` (parsed
     /// from `tclig`'s `[GNUPG:] INV_RECP` status lines) so the compose
@@ -72,6 +77,12 @@ public protocol TumpaCryptoXPC {
     ///   verify.
     /// - `"unknown"` — inner signature present, signer not in keystore;
     ///   `signerKeyId` is the issuer key ID for display.
+    ///
+    /// Card-first dispatch: when the user's decryption subkey lives on a
+    /// connected OpenPGP card, the card decrypts the session key and the
+    /// inner-signature classification runs in software; otherwise the
+    /// software secret key (with passphrase via pinentry) is used. The
+    /// reply shape is identical for both backends.
     ///
     /// Plaintext is returned regardless of signature outcome (matching
     /// Thunderbird / GPG Suite behavior — the user sees the body with

@@ -74,6 +74,10 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
         reply: @escaping (Data?, [String], NSError?) -> Void
     ) {
         workQueue.async {
+            let tcligPath = (try? self.runner.tcligURL().path) ?? "<unresolved>"
+            svcLog.info(
+                "encrypt called — tclig=\(tcligPath, privacy: .public) plaintextSize=\(plaintext.count) recipients=\(recipientFingerprints, privacy: .public) signer=\(signerFingerprint ?? "<none>", privacy: .public) armor=\(armor)"
+            )
             do {
                 let ct = try self.runner.encrypt(
                     plaintext: plaintext,
@@ -81,10 +85,15 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
                     signerFingerprint: signerFingerprint,
                     armor: armor
                 )
+                svcLog.info("encrypt OK — ciphertextSize=\(ct.count)")
                 reply(ct, [], nil)
             } catch let TclibError.invalidRecipients(bad) {
+                svcLog.error("encrypt FAILED with invalidRecipients=\(bad, privacy: .public)")
                 reply(nil, bad, Self.nsError(TclibError.invalidRecipients(bad)))
             } catch {
+                svcLog.error(
+                    "encrypt FAILED — \(error.localizedDescription, privacy: .public) :: \(String(describing: error), privacy: .public)"
+                )
                 reply(nil, [], Self.nsError(error))
             }
         }

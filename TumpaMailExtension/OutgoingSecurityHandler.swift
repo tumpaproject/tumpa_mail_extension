@@ -755,11 +755,23 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             // Sign-then-encrypt (or encrypt-only) into a single
             // OpenPGP message; PGP/MIME wraps the result.
             let plaintext = try PGPMimeBuilder.extractInnerPart(from: rawMessage)
-            let armored = try await xpcEncrypt(
-                plaintext: plaintext,
-                recipients: recipientFprs,
-                signer: shouldSign ? signer : nil
+            log.info(
+                "encode: calling xpc.encrypt — plaintextSize=\(plaintext.count) recipients=\(recipientFprs, privacy: .public) signer=\(shouldSign ? (signer ?? "<nil>") : "<none>", privacy: .public)"
             )
+            let armored: Data
+            do {
+                armored = try await xpcEncrypt(
+                    plaintext: plaintext,
+                    recipients: recipientFprs,
+                    signer: shouldSign ? signer : nil
+                )
+            } catch {
+                log.error(
+                    "encode: xpc.encrypt FAILED — \(error.localizedDescription, privacy: .public) :: \(String(describing: error), privacy: .public)"
+                )
+                throw error
+            }
+            log.info("encode: xpc.encrypt OK — ciphertextSize=\(armored.count)")
             let encoded = try PGPMimeBuilder.buildEncryptedMessage(
                 original: rawMessage,
                 armoredCiphertext: armored,
