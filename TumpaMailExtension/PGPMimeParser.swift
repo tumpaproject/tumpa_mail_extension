@@ -73,11 +73,18 @@ enum PGPMimeParser {
     static func hasPGPMarkers(in data: Data) -> Bool {
         let s = String(decoding: data, as: UTF8.self)
         let opts: String.CompareOptions = [.caseInsensitive, .literal]
-        let signed = s.range(of: "multipart/signed", options: opts) != nil
-            && s.range(of: "application/pgp-signature", options: opts) != nil
-        let encrypted = s.range(of: "multipart/encrypted", options: opts) != nil
-            && s.range(of: "application/pgp-encrypted", options: opts) != nil
-        return signed || encrypted
+        // The MIME-type tokens `application/pgp-encrypted` and
+        // `application/pgp-signature` are PGP-specific (RFC 3156 §3,
+        // §6.1) and present in EVERY PGP/MIME message regardless of
+        // the outer wrapper type. We deliberately do NOT also require
+        // `multipart/encrypted` / `multipart/signed` — Microsoft
+        // Outlook (Exchange Online) emits broken PGP/MIME wrapped as
+        // `multipart/mixed` with the version + ciphertext parts
+        // base64-encoded as if they were attachments (observed
+        // 2026-04-28 with `jocar2.eml`). Anchoring on the inner
+        // pgp-* tokens makes the precheck robust to that variant.
+        return s.range(of: "application/pgp-encrypted", options: opts) != nil
+            || s.range(of: "application/pgp-signature", options: opts) != nil
     }
 
     /// Classify a top-level RFC 822 message.
@@ -97,6 +104,23 @@ enum PGPMimeParser {
             if lc.hasPrefix("multipart/signed") &&
                 contentTypeMatchesProtocol(contentType, "application/pgp-signature") {
                 return classifySigned(rawMessage: raw, split: split, headerValue: contentType)
+            }
+
+            // Outlook (Exchange Online) emits PGP/MIME encrypted mail
+            // wrapped as `multipart/mixed` with the version part and
+            // ciphertext base64-encoded as attachments — RFC 3156
+            // §4 violation, but common enough in the wild that we
+            // need to handle it. Recognise any `multipart/*` whose
+            // children include both an `application/pgp-encrypted`
+            // version part and a part whose decoded body is an OpenPGP
+            // armored MESSAGE, and treat it as encrypted.
+            if lc.hasPrefix("multipart/") {
+                if let ciphertext = extractOutlookPGPMimeCiphertext(
+                    split: split,
+                    outerHeaderValue: contentType
+                ) {
+                    return .pgpEncrypted(ciphertext: ciphertext)
+                }
             }
         } catch {
             // Anything malformed is "not PGP" from our point of view —
@@ -139,6 +163,89 @@ enum PGPMimeParser {
             }
         }
         return .notPGP
+    }
+
+    /// Outlook-fallback. Walk the children of any `multipart/*` body
+    /// and return the OpenPGP armored ciphertext if we find:
+    ///   - one part with Content-Type `application/pgp-encrypted`
+    ///     (the RFC 3156 version-control packet — its presence is the
+    ///     load-bearing signal that the sender intended PGP/MIME), AND
+    ///   - one part whose decoded body is an `-----BEGIN PGP MESSAGE-----`
+    ///     ... `-----END PGP MESSAGE-----` armor block.
+    /// Per-part `Content-Transfer-Encoding: base64` is honored (Outlook
+    /// double-encodes the armor as base64 even though the armor is
+    /// already 7-bit clean — that's the bug).
+    private static func extractOutlookPGPMimeCiphertext(
+        split: PGPMimeBuilder.SplitMessage,
+        outerHeaderValue: String
+    ) -> Data? {
+        guard let boundary = parseBoundary(from: outerHeaderValue) else {
+            return nil
+        }
+        let parts = sliceParts(body: split.body, boundary: boundary)
+        var sawVersionPart = false
+        var armoredCiphertext: Data? = nil
+        for partBytes in parts {
+            guard let inner = try? PGPMimeBuilder.splitHeadersAndBody(partBytes) else {
+                continue
+            }
+            let ct = inner.headers
+                .first(where: { $0.name.lowercased() == "content-type" })?
+                .value.lowercased() ?? ""
+            let cte = inner.headers
+                .first(where: { $0.name.lowercased() == "content-transfer-encoding" })?
+                .value.lowercased().trimmingCharacters(in: .whitespaces) ?? "7bit"
+
+            if ct.hasPrefix("application/pgp-encrypted") {
+                sawVersionPart = true
+                continue
+            }
+
+            // Any non-version part — try to decode and see if its body
+            // is a PGP armor block.
+            let decoded = decodePartBody(inner.body, transferEncoding: cte)
+            if let armor = sliceArmoredPGPMessage(in: decoded) {
+                armoredCiphertext = armor
+            }
+        }
+        guard sawVersionPart, let armor = armoredCiphertext else { return nil }
+        return armor
+    }
+
+    /// Decode a part body honoring the part's Content-Transfer-Encoding.
+    /// We currently honor `base64` (Outlook's variant); `quoted-printable`
+    /// could be added if the wild ever produces it for PGP/MIME parts.
+    /// Anything else (`7bit`, `8bit`, `binary`, missing) is returned
+    /// verbatim — RFC 3156 §4 says PGP/MIME parts SHOULD be 7bit.
+    private static func decodePartBody(_ body: Data, transferEncoding: String) -> Data {
+        if transferEncoding == "base64" {
+            // The body has CRLF line breaks every 76 chars (Outlook
+            // wraps at 76); ignoreUnknownCharacters drops the CRLFs.
+            if let decoded = Data(
+                base64Encoded: body,
+                options: [.ignoreUnknownCharacters]
+            ) {
+                return decoded
+            }
+        }
+        return body
+    }
+
+    /// Find an OpenPGP armor block (`-----BEGIN PGP MESSAGE-----` …
+    /// `-----END PGP MESSAGE-----`, including the closing line) in
+    /// `data`. Returns the trimmed armor bytes, or nil if not found.
+    /// Used by the Outlook-fallback path; `tclig --decrypt` accepts
+    /// armored input, so we hand it the slice as-is.
+    private static func sliceArmoredPGPMessage(in data: Data) -> Data? {
+        let begin = "-----BEGIN PGP MESSAGE-----".data(using: .ascii)!
+        let end = "-----END PGP MESSAGE-----".data(using: .ascii)!
+        guard
+            let beginRange = data.range(of: begin),
+            let endRange = data.range(of: end, in: beginRange.upperBound..<data.endIndex)
+        else {
+            return nil
+        }
+        return data.subdata(in: beginRange.lowerBound..<endRange.upperBound)
     }
 
     // MARK: - multipart/signed

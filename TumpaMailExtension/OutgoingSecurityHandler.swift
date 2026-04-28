@@ -367,16 +367,58 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         let result = blockingXPC { try await self.xpc.decryptVerify(ciphertext: ciphertext) }
         switch result {
         case .success(let r):
-            let isSigned = r.signatureStatus != TumpaSignatureStatus.unsigned
+            // Default: use whatever decryptVerify reported (covers the
+            // sign-then-encrypt OpenPGP-native case, where the
+            // signature lives inside the encrypted packet stream and
+            // tclig's --verify-decrypt surfaces it as GOODSIG/BADSIG).
+            var signatureStatus = r.signatureStatus
+            var signerFp = r.signerFingerprint
+            var signerKid = r.signerKeyId
+            var signerUid = r.signerUid
+            var bodyForAssembly = r.plaintext
+
+            // Sign-then-encrypt at the MIME layer (RFC 3156 §6.2): the
+            // decrypted plaintext is itself a `multipart/signed`
+            // entity. tclig reports unsigned because there's no
+            // OpenPGP-native sig inside the encrypted blob; we have to
+            // run a detached verify on the inner multipart/signed
+            // ourselves. Observed 2026-04-28 with `jocar2.eml`
+            // (Apple-Mail-style boundary inside the decrypted
+            // payload).
+            if signatureStatus == TumpaSignatureStatus.unsigned,
+               case let .pgpSigned(signedPart, signature, _) = PGPMimeParser.classify(r.plaintext) {
+                log.info("decodeEncrypted: inner multipart/signed detected (signedPart=\(signedPart.count)B sig=\(signature.count)B); running detached verify")
+                let canonical = PGPMimeBuilder.canonicalizeForSigning(signedPart)
+                let verify = blockingXPC {
+                    try await self.xpc.verifyDetached(
+                        signedBytes: canonical,
+                        signature: signature
+                    )
+                }
+                if case .success(let v) = verify {
+                    signatureStatus = v.status
+                    signerFp = v.signerFingerprint
+                    signerUid = v.signerUid
+                    signerKid = nil
+                    // Use the SIGNED ENTITY (inner MIME part) as the
+                    // assembled body — we don't want the multipart/signed
+                    // wrapper to render in Mail's viewer; the signature
+                    // status is conveyed via MEMessageSecurityInformation,
+                    // not by leaving the wrapper visible.
+                    bodyForAssembly = signedPart
+                }
+            }
+
+            let isSigned = signatureStatus != TumpaSignatureStatus.unsigned
             let secCtx = securityContext(
                 isEncrypted: true,
-                signatureStatus: r.signatureStatus,
-                fingerprint: r.signerFingerprint,
-                uid: r.signerUid,
-                keyId: r.signerKeyId,
+                signatureStatus: signatureStatus,
+                fingerprint: signerFp,
+                uid: signerUid,
+                keyId: signerKid,
                 errorMessage: nil
             )
-            let signingError = signingError(for: r.signatureStatus, hadSignature: isSigned)
+            let signingError = signingError(for: signatureStatus, hadSignature: isSigned)
             // Crash-safety: only populate the signers slot on a CLEAN
             // verification (status=good). When signingError is set,
             // Mail's library treats `signers` as authoritative-but-
@@ -386,9 +428,9 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             // MessageSecurityHandler.swift:521-535): success ⇒ signers,
             // any error ⇒ empty signers + the error.
             let signers = signingError == nil ? makeSigners(
-                fingerprint: r.signerFingerprint,
-                uid: r.signerUid,
-                keyId: r.signerKeyId,
+                fingerprint: signerFp,
+                uid: signerUid,
+                keyId: signerKid,
                 contextPayload: secCtx
             ) : []
             let secInfo = MEMessageSecurityInformation(
@@ -408,8 +450,8 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             // nothing.
             let assembled = (try? PGPMimeBuilder.assembleInboundDecodedMessage(
                 envelopeSource: original,
-                decryptedInnerPart: r.plaintext
-            )) ?? r.plaintext
+                decryptedInnerPart: bodyForAssembly
+            )) ?? bodyForAssembly
             return MEDecodedMessage(
                 data: assembled,
                 securityInformation: secInfo,

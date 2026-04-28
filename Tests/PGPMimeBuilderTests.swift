@@ -524,11 +524,176 @@ final class PGPMimeParserMarkerPrecheckTests: XCTestCase {
         XCTAssertTrue(PGPMimeParser.hasPGPMarkers(in: Data(msg.utf8)))
     }
 
-    /// Negative: a message that mentions "multipart/signed" only in
-    /// natural-language body text (no `application/pgp-signature`)
-    /// should NOT trip the precheck. Both markers required.
-    func testHasPGPMarkers_BodyTextMentionsSigned_NotDetected() {
-        let msg = "From: a@example.com\r\nContent-Type: text/plain\r\n\r\nThe spec calls this multipart/signed, by the way.\r\n"
-        XCTAssertFalse(PGPMimeParser.hasPGPMarkers(in: Data(msg.utf8)))
+    /// Negative: a message whose body mentions PGP MIME types only in
+    /// natural-language text — no real `application/pgp-*` MIME
+    /// header — would trip our precheck (we accept the substring
+    /// match). That's intentional: precheck cost is low, classify
+    /// will reject the false positive cleanly. Documenting the
+    /// chosen behaviour rather than testing for false-negative.
+    func testHasPGPMarkers_BodyTextMentionsTokens_DocumentsTrueResult() {
+        let msg = "From: a@example.com\r\nContent-Type: text/plain\r\n\r\nApplication/pgp-encrypted is an MIME type defined by RFC 3156.\r\n"
+        XCTAssertTrue(PGPMimeParser.hasPGPMarkers(in: Data(msg.utf8)),
+            "Substring-based precheck deliberately fires on body-text mentions; classify is responsible for the final decision")
+    }
+
+    /// Outlook (Exchange Online) emits PGP/MIME mail wrapped as
+    /// `multipart/mixed` with the version + ciphertext base64-encoded
+    /// as attachments — RFC 3156 violation. The precheck must still
+    /// fire so classify gets a chance to reroute it.
+    func testHasPGPMarkers_OutlookMultipartMixedVariant_Detected() {
+        let msg = """
+            From: jocar@sunet.se\r
+            Content-Type: multipart/mixed; boundary="b"\r
+            \r
+            --b\r
+            Content-Type: application/pgp-encrypted\r
+            Content-Transfer-Encoding: base64\r
+            \r
+            VmVyc2lvbjogMQ0NCg==\r
+            --b\r
+            Content-Type: application/octet-stream; name="encrypted.asc"\r
+            Content-Transfer-Encoding: base64\r
+            \r
+            LS0tLS1CRUdJTiBQR1AgTUVTU0FHRS0tLS0tCg==\r
+            --b--\r
+            """
+        XCTAssertTrue(PGPMimeParser.hasPGPMarkers(in: Data(msg.utf8)),
+            "Outlook variant uses multipart/mixed but still has application/pgp-encrypted; precheck must catch it")
+    }
+}
+
+/// Tests for `PGPMimeParser.classify` — covers the strict RFC 3156
+/// path AND the Outlook-fallback path that rescues encrypted mail
+/// from Exchange Online's broken `multipart/mixed` wrapping.
+final class PGPMimeParserClassifyTests: XCTestCase {
+
+    /// Strict path: a properly-formed `multipart/encrypted` message
+    /// classifies as `pgpEncrypted` and the ciphertext slice is the
+    /// armor block from the `application/octet-stream` part.
+    func testClassify_StrictMultipartEncrypted_ReturnsCiphertext() {
+        let armor = "-----BEGIN PGP MESSAGE-----\r\n\r\nABCDEF==\r\n-----END PGP MESSAGE-----"
+        let msg = """
+            Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="b"\r
+            \r
+            --b\r
+            Content-Type: application/pgp-encrypted\r
+            \r
+            Version: 1\r
+            --b\r
+            Content-Type: application/octet-stream\r
+            \r
+            \(armor)\r
+            --b--\r
+            """
+        switch PGPMimeParser.classify(Data(msg.utf8)) {
+        case .pgpEncrypted(let cipher):
+            XCTAssertTrue(String(decoding: cipher, as: UTF8.self).contains("BEGIN PGP MESSAGE"))
+        default:
+            XCTFail("expected pgpEncrypted classification")
+        }
+    }
+
+    /// Outlook variant: `multipart/mixed` outer, base64-encoded
+    /// version + ciphertext parts. classify must reroute to
+    /// `pgpEncrypted` and base64-decode the armor.
+    func testClassify_OutlookMultipartMixed_Base64Armor_ReturnsCiphertext() {
+        let armor = "-----BEGIN PGP MESSAGE-----\r\n\r\nABCDEF==\r\n-----END PGP MESSAGE-----\r\n"
+        let armorB64 = Data(armor.utf8).base64EncodedString(options: [.lineLength76Characters, .endLineWithCarriageReturn, .endLineWithLineFeed])
+        let msg = """
+            From: jocar@sunet.se\r
+            To: kushal@civilized.systems\r
+            Content-Type: multipart/mixed; boundary="b"\r
+            \r
+            --b\r
+            Content-Type: text/plain; charset="us-ascii"\r
+            Content-Transfer-Encoding: quoted-printable\r
+            \r
+            \r
+            --b\r
+            Content-Type: application/pgp-encrypted; name="PGPMIME Versions Identification"\r
+            Content-Transfer-Encoding: base64\r
+            \r
+            VmVyc2lvbjogMQ0NCg==\r
+            --b\r
+            Content-Type: application/octet-stream; name="encrypted.asc"\r
+            Content-Transfer-Encoding: base64\r
+            \r
+            \(armorB64)\r
+            --b--\r
+            """
+        switch PGPMimeParser.classify(Data(msg.utf8)) {
+        case .pgpEncrypted(let cipher):
+            let s = String(decoding: cipher, as: UTF8.self)
+            XCTAssertTrue(s.hasPrefix("-----BEGIN PGP MESSAGE-----"),
+                "Outlook variant: base64 must be decoded back to armor before handing to decrypt")
+            XCTAssertTrue(s.contains("-----END PGP MESSAGE-----"))
+        default:
+            XCTFail("expected pgpEncrypted classification (Outlook fallback)")
+        }
+    }
+
+    /// Encrypted-then-MIME-signed (RFC 3156 §6.2): the decrypted
+    /// plaintext is itself a `multipart/signed` entity. The decode
+    /// path reclassifies the plaintext to find the signature; this
+    /// test guards that classify recognises a multipart/signed body
+    /// (no envelope headers — just the multipart entity, mirroring
+    /// what `tclig --decrypt` returns). Observed 2026-04-28 with
+    /// `jocar2.eml`: Apple-Mail-style multipart/signed inside an
+    /// Outlook-wrapped encrypted message.
+    func testClassify_BarePlaintextMultipartSigned_RecognisedAsSigned() {
+        // Note: no envelope headers — just a top-level multipart/signed
+        // entity. classify already accepts this because
+        // splitHeadersAndBody parses the very first header block as
+        // the envelope.
+        let signedBody = "Content-Type: text/plain; charset=us-ascii\r\n\r\nSuper secret\r\n"
+        let sig = "-----BEGIN PGP SIGNATURE-----\r\n\r\nABCDEF==\r\n-----END PGP SIGNATURE-----"
+        let msg = """
+            Content-Type: multipart/signed; protocol="application/pgp-signature"; boundary="b"; micalg=pgp-sha512\r
+            \r
+            --b\r
+            \(signedBody)\r
+            --b\r
+            Content-Type: application/pgp-signature\r
+            \r
+            \(sig)\r
+            --b--\r
+            """
+        switch PGPMimeParser.classify(Data(msg.utf8)) {
+        case .pgpSigned(let signedPart, let signature, _):
+            XCTAssertTrue(String(decoding: signedPart, as: UTF8.self).contains("Super secret"),
+                "signed entity must contain the inner body bytes")
+            XCTAssertTrue(String(decoding: signature, as: UTF8.self).hasPrefix("-----BEGIN PGP SIGNATURE-----"),
+                "extracted signature must be the armor block")
+        default:
+            XCTFail("expected pgpSigned classification of bare multipart/signed plaintext")
+        }
+    }
+
+    /// Negative: `multipart/mixed` with a generic attachment but NO
+    /// `application/pgp-encrypted` version part — must NOT classify
+    /// as encrypted (otherwise we'd treat every mail with a
+    /// `.asc`-named attachment as encrypted).
+    func testClassify_PlainMultipartMixedWithAttachment_NotPGP() {
+        let msg = """
+            Content-Type: multipart/mixed; boundary="b"\r
+            \r
+            --b\r
+            Content-Type: text/plain\r
+            \r
+            hi\r
+            --b\r
+            Content-Type: application/octet-stream; name="key.asc"\r
+            \r
+            -----BEGIN PGP PUBLIC KEY BLOCK-----\r
+            ...\r
+            -----END PGP PUBLIC KEY BLOCK-----\r
+            --b--\r
+            """
+        switch PGPMimeParser.classify(Data(msg.utf8)) {
+        case .notPGP:
+            break
+        default:
+            XCTFail("plain multipart/mixed with non-PGP attachment must classify as notPGP")
+        }
     }
 }
