@@ -201,15 +201,12 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
 
         log.info("encode shouldSign=\(shouldSign) shouldEncrypt=\(shouldEncrypt) rawSize=\(message.rawData?.count ?? -1)")
 
-        // Diagnostic dump: write whatever we hand back to Mail to
-        // /tmp/ so the bytes survive Mail's crash for post-mortem
-        // inspection. Filename has a counter + timestamp so multiple
-        // test sends each leave their own file.
-        //
-        // Also writes the *original* (Mail-supplied) RFC 822 bytes
-        // alongside, so we can diff "before" vs "after our encode"
-        // to see exactly what we changed. Comment out before ship.
-        let DIAG_DUMP = true
+        // Diagnostic dump: when set true, writes both the original
+        // (Mail-supplied) and the encoded RFC 822 bytes to the
+        // .appex's tmp directory so the bytes survive a Mail crash
+        // for post-mortem. Off in shipping builds — flip to true
+        // locally when iterating on encode/decode shape problems.
+        let DIAG_DUMP = false
 
         // Nothing to do — return a no-op result. Per
         // MEMessageEncodingResult docs, an `encodedMessage` of nil
@@ -788,10 +785,27 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             // `-[__NSSetM addObject:]: object cannot be nil`. The
             // working reference does the same (passes `body =
             // message.rawData`).
+            // When signing too, resolve the signer's primary UID from
+            // the keystore so the cached `MEMessageSigner` carries a
+            // real RFC 822 address (e.g. `Kushal Das <kushal@…>`)
+            // instead of the synthetic `openpgp:<fpr>` placeholder.
+            // Mail's reader silently elides signer info from any
+            // signer whose emailAddresses aren't real addresses, so
+            // skipping this lookup costs us the on-screen "Signed by"
+            // badge for the Sent-copy render — the most visible
+            // user-facing signal that signing actually happened.
+            let signerUid: String?
+            if shouldSign, let signer {
+                signerUid = await lookupSignerUid(fingerprint: signer)
+            } else {
+                signerUid = nil
+            }
             let outboundDecoded = makeOutgoingDecodedMessage(
                 data: rawMessage,
                 isSigned: shouldSign,
-                isEncrypted: true
+                isEncrypted: true,
+                signerFingerprint: signer,
+                signerUid: signerUid
             )
             cacheOutboundDecoded(outboundDecoded, draft: message, encoded: encoded.bytes)
 
@@ -839,11 +853,13 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         // the Sent copy during indexing, and a synchronous re-verify
         // there is unnecessary churn (we already verified by virtue
         // of having just signed these bytes ourselves).
+        let signerUid = await lookupSignerUid(fingerprint: signer)
         let outboundDecoded = makeOutgoingDecodedMessage(
             data: rawMessage,
             isSigned: true,
             isEncrypted: false,
-            signerFingerprint: signer
+            signerFingerprint: signer,
+            signerUid: signerUid
         )
         cacheOutboundDecoded(outboundDecoded, draft: message, encoded: encoded.bytes)
 
@@ -862,21 +878,22 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         data: Data,
         isSigned: Bool,
         isEncrypted: Bool,
-        signerFingerprint: String? = nil
+        signerFingerprint: String? = nil,
+        signerUid: String? = nil
     ) -> MEDecodedMessage {
         let status: String = isSigned ? TumpaSignatureStatus.good : TumpaSignatureStatus.unsigned
         let secCtx = securityContext(
             isEncrypted: isEncrypted,
             signatureStatus: status,
             fingerprint: signerFingerprint,
-            uid: nil,
+            uid: signerUid,
             keyId: nil,
             errorMessage: nil
         )
         let signers = isSigned
             ? makeSigners(
                 fingerprint: signerFingerprint,
-                uid: nil,
+                uid: signerUid,
                 keyId: nil,
                 contextPayload: secCtx
             )
@@ -931,6 +948,23 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
     /// a real RFC 3156 envelope.
     private func makeOpaqueEncodedMessage(rawData: Data) -> MEEncodedOutgoingMessage {
         MEEncodedOutgoingMessage(rawData: rawData, isSigned: false, isEncrypted: false)
+    }
+
+    /// Look up the primary UID for a fingerprint in the keystore.
+    /// Used at outbound encode time so we can populate
+    /// `MEMessageSigner.emailAddresses` with a real RFC 822 address
+    /// instead of the synthetic `openpgp:<fingerprint>` placeholder
+    /// `makeSigners` falls back to. Mail's reader silently drops the
+    /// signer indicator if the signer's email isn't a real address —
+    /// the synthetic form is recognized as invalid and quietly elided
+    /// (no badge, no signer info), even though the cached
+    /// `MEDecodedMessage` is otherwise correct.
+    ///
+    /// Returns nil on miss; the caller falls back to fingerprint-only
+    /// signers (which Mail will quietly hide but won't crash on).
+    private func lookupSignerUid(fingerprint: String) async -> String? {
+        guard let keys = try? await xpc.listKeys() else { return nil }
+        return keys.first(where: { $0.fingerprint == fingerprint })?.primaryUid
     }
 
     /// Resolve the sender's encryption-capable cert fingerprint from

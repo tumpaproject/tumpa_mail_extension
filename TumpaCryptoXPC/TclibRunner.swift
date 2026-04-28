@@ -188,12 +188,14 @@ public final class TclibRunner {
         if armor { args.append("--armor") }
         for r in recipients { args.append(contentsOf: ["-r", r]) }
         if let s = signerFingerprint {
-            // tclig's encrypt + sign in one pass is via a future
-            // `--sign` co-flag; for v1 we sign-then-encrypt by piping.
-            // Until tclig wires sign+encrypt-in-one-call, fall back
-            // to the wecanencrypt-level primitive via a small helper
-            // (TODO Phase 2 — surface it through tclig).
-            _ = s
+            // Sign-then-encrypt single-pass: produces an OpenPGP
+            // message with a one-pass signature + literal + signature
+            // packets, equivalent to `gpg --sign --encrypt`. tclig
+            // routes this to wecanencrypt::sign_and_encrypt_to_multiple
+            // when both --encrypt and -u are present. Software-key
+            // only at this layer (card-backed sign+encrypt is not
+            // yet wired through libtumpa).
+            args.append(contentsOf: ["--sign", "-u", s])
         }
 
         do {
