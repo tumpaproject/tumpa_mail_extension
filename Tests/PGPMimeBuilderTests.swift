@@ -323,6 +323,81 @@ final class PGPMimeBuilderInboundAssemblyTests: XCTestCase {
                       "CRLF envelope must produce CRLF assembled headers")
     }
 
+    /// Real-world inbound case: outer envelope is LF (Mail strips CR
+    /// before invoking `decodedMessage`), decrypted inner part is a
+    /// CRLF `multipart/alternative` (Thunderbird-Android, Gmail, etc.
+    /// canonicalise to CRLF before encrypting). The assembled body
+    /// must use a CONSISTENT line ending so Mail's reader can walk
+    /// the `--boundary` lines and render the alternatives instead of
+    /// dumping the whole MIME tree as raw text. Reproduces the
+    /// `kano1.eml` symptom from 2026-04-28.
+    func testAssembleInbound_LFEnvelope_CRLFMultipartInner_BodyIsLineEndingConsistent() throws {
+        let envelope = Data(
+            "From: a@example.com\nSubject: x\nMessage-Id: <m@x>\nContent-Type: multipart/encrypted\n\nbody"
+                .utf8
+        )
+        // Inner part: CRLF throughout, multipart/alternative with
+        // text/plain + text/html. Mirrors what tclig --decrypt
+        // returns for a Thunderbird-Android-sent encrypted mail.
+        let boundary = "----ABCXYZ"
+        let inner = Data((
+            "Content-Type: multipart/alternative; boundary=\"\(boundary)\"\r\n"
+            + "\r\n"
+            + "--\(boundary)\r\n"
+            + "Content-Type: text/plain; charset=utf-8\r\n"
+            + "\r\n"
+            + "Hello plain\r\n"
+            + "--\(boundary)\r\n"
+            + "Content-Type: text/html; charset=utf-8\r\n"
+            + "\r\n"
+            + "<p>Hello html</p>\r\n"
+            + "--\(boundary)--\r\n"
+        ).utf8)
+        let assembled = try PGPMimeBuilder.assembleInboundDecodedMessage(
+            envelopeSource: envelope, decryptedInnerPart: inner
+        )
+        // The whole assembled message must NOT contain a CR — the
+        // envelope is LF, so the inner body must have been rewritten
+        // to LF too. Any leftover \r between the body's boundary
+        // lines is what triggers the kano1 symptom.
+        XCTAssertFalse(assembled.contains(0x0D),
+                       "inner body's CRLF must be rewritten to match the LF envelope so Mail can walk the multipart boundaries")
+        // Sanity: the boundary lines are still present and parsable.
+        let s = String(data: assembled, encoding: .utf8)!
+        XCTAssertTrue(s.contains("\n--\(boundary)\n"),
+                      "boundary delimiters must survive line-ending normalization")
+        XCTAssertTrue(s.contains("\n--\(boundary)--\n")
+                      || s.hasSuffix("\n--\(boundary)--"),
+                      "closing boundary must survive line-ending normalization")
+        XCTAssertTrue(s.contains("Content-Type: multipart/alternative"),
+                      "inner part Content-Type lifted to envelope")
+    }
+
+    /// Symmetric case: CRLF envelope + LF inner body — rare in
+    /// practice (Mail almost always hands LF) but the helper must be
+    /// robust to it.
+    func testAssembleInbound_CRLFEnvelope_LFInner_BodyIsLineEndingConsistent() throws {
+        let envelope = Data(
+            "From: a@example.com\r\nSubject: x\r\nMessage-Id: <m@x>\r\nContent-Type: multipart/encrypted\r\n\r\nbody"
+                .utf8
+        )
+        let inner = Data("Content-Type: text/plain\n\nLine 1\nLine 2\n".utf8)
+        let assembled = try PGPMimeBuilder.assembleInboundDecodedMessage(
+            envelopeSource: envelope, decryptedInnerPart: inner
+        )
+        let s = String(data: assembled, encoding: .utf8)!
+        // No bare LF anywhere in the assembled output.
+        var prev: UInt8 = 0
+        for byte in assembled {
+            if byte == 0x0A {
+                XCTAssertEqual(prev, 0x0D, "bare LF found in CRLF-targeted assembled output")
+            }
+            prev = byte
+        }
+        XCTAssertTrue(s.contains("Line 1\r\nLine 2"),
+                      "LF inner body rewritten to CRLF")
+    }
+
     /// Apple-internal `X-Apple-*` headers from the outer envelope
     /// don't leak into the assembled output (they're compose-state
     /// from the sender's machine and irrelevant on inbound).
@@ -342,5 +417,118 @@ final class PGPMimeBuilderInboundAssemblyTests: XCTestCase {
         let s = String(data: assembled, encoding: .utf8)!
         XCTAssertFalse(s.contains("X-Apple-Auto-Saved"),
                        "X-Apple-* headers from sender's compose state must not leak to inbound assembled view")
+    }
+}
+
+/// Tests for `PGPMimeParser.hasPGPMarkers` — the cheap precheck that
+/// gates the expensive `classify` + XPC verify path. Bug fix for
+/// 2026-04-28 `jocar1.eml` regression: an earlier version capped the
+/// scan at 8 KiB, which silently dropped legitimately-signed mail
+/// routed through Microsoft 365 / Exchange (where the ARC + DKIM +
+/// `x-ms-*` header pile alone exceeds 8 KiB). Mail showed no
+/// security indicator on the message.
+final class PGPMimeParserMarkerPrecheckTests: XCTestCase {
+
+    /// Baseline: a small `multipart/signed` message — markers visible
+    /// well inside any prefix window.
+    func testHasPGPMarkers_SmallSigned_Detected() {
+        let msg = """
+            From: a@example.com\r
+            Subject: x\r
+            Content-Type: multipart/signed; protocol="application/pgp-signature"; boundary="b"; micalg=pgp-sha256\r
+            \r
+            --b\r
+            Content-Type: text/plain\r
+            \r
+            hi\r
+            --b\r
+            Content-Type: application/pgp-signature\r
+            \r
+            -----BEGIN PGP SIGNATURE-----\r
+            -----END PGP SIGNATURE-----\r
+            --b--\r
+            """
+        XCTAssertTrue(PGPMimeParser.hasPGPMarkers(in: Data(msg.utf8)))
+    }
+
+    /// Baseline: a small `multipart/encrypted` message — markers also
+    /// detected.
+    func testHasPGPMarkers_SmallEncrypted_Detected() {
+        let msg = """
+            From: a@example.com\r
+            Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="b"\r
+            \r
+            --b\r
+            Content-Type: application/pgp-encrypted\r
+            \r
+            Version: 1\r
+            --b\r
+            Content-Type: application/octet-stream\r
+            \r
+            -----BEGIN PGP MESSAGE-----\r
+            -----END PGP MESSAGE-----\r
+            --b--\r
+            """
+        XCTAssertTrue(PGPMimeParser.hasPGPMarkers(in: Data(msg.utf8)))
+    }
+
+    /// Regression for the `jocar1.eml` symptom: 16 KiB of leading
+    /// header padding (mimicking Microsoft 365 ARC + DKIM +
+    /// `x-microsoft-antispam-messagedata-*` chunks) pushes the
+    /// `Content-Type: multipart/signed` line WELL past the old 8 KiB
+    /// cutoff. The whole-message scan must still see the markers.
+    func testHasPGPMarkers_HeavyHeaderPile_StillDetected() {
+        var headers = "From: jocar@sunet.se\r\nSubject: Re: My public key\r\n"
+        // 16 KiB of x-microsoft-antispam-messagedata-style padding
+        // before the real Content-Type header. ~80 bytes per line ×
+        // 200 lines ≈ 16 KiB.
+        for i in 0..<200 {
+            headers += "X-Microsoft-Antispam-Messagedata-\(i): "
+                + String(repeating: "A", count: 70) + "\r\n"
+        }
+        headers += "Content-Type: multipart/signed; protocol=\"application/pgp-signature\"; boundary=\"b\"; micalg=pgp-sha512\r\n"
+        let body = """
+            \r
+            --b\r
+            Content-Type: text/plain\r
+            \r
+            hi\r
+            --b\r
+            Content-Type: application/pgp-signature\r
+            \r
+            -----BEGIN PGP SIGNATURE-----\r
+            -----END PGP SIGNATURE-----\r
+            --b--\r
+            """
+        let data = Data((headers + body).utf8)
+        XCTAssertGreaterThan(data.count, 8192,
+            "test fixture must exceed the OLD 8 KiB cutoff to be a real regression guard")
+        XCTAssertTrue(PGPMimeParser.hasPGPMarkers(in: data),
+            "marker scan must cover the WHOLE message; bytes past 8 KiB carry the multipart/signed Content-Type when routed through MS Exchange")
+    }
+
+    /// Negative: an inbox-typical 12 KiB plain-text mail with no PGP
+    /// must NOT trigger the precheck (otherwise we churn tclig per
+    /// inbox message).
+    func testHasPGPMarkers_PlainBigMessage_NotDetected() {
+        let big = "From: a@example.com\r\nSubject: x\r\nContent-Type: text/plain\r\n\r\n"
+            + String(repeating: "lorem ipsum dolor sit amet ", count: 500)
+        XCTAssertFalse(PGPMimeParser.hasPGPMarkers(in: Data(big.utf8)))
+    }
+
+    /// Case-insensitive: RFC 2045 §5.1 says MIME type/subtype tokens
+    /// match case-insensitively. Some senders emit `Multipart/Signed`
+    /// with capital letters.
+    func testHasPGPMarkers_MixedCase_Detected() {
+        let msg = "Content-Type: Multipart/Signed; protocol=\"Application/PGP-Signature\"; boundary=\"b\"\r\n\r\nbody"
+        XCTAssertTrue(PGPMimeParser.hasPGPMarkers(in: Data(msg.utf8)))
+    }
+
+    /// Negative: a message that mentions "multipart/signed" only in
+    /// natural-language body text (no `application/pgp-signature`)
+    /// should NOT trip the precheck. Both markers required.
+    func testHasPGPMarkers_BodyTextMentionsSigned_NotDetected() {
+        let msg = "From: a@example.com\r\nContent-Type: text/plain\r\n\r\nThe spec calls this multipart/signed, by the way.\r\n"
+        XCTAssertFalse(PGPMimeParser.hasPGPMarkers(in: Data(msg.utf8)))
     }
 }

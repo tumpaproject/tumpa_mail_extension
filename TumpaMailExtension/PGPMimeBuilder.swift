@@ -274,6 +274,41 @@ enum PGPMimeBuilder {
         return out
     }
 
+    /// Rewrite `data`'s line endings to `eol` (which must be `crlf` or
+    /// `lf`). Treats CR / LF / CRLF interchangeably as a single line
+    /// terminator and re-emits each one as `eol`. Used on the inbound
+    /// decode path to align the decrypted inner body with the outer
+    /// envelope's eol style — Mail's reader fails to walk a
+    /// `multipart/*` body whose `--boundary` lines use a different
+    /// line-ending than the surrounding headers, and falls back to
+    /// rendering the whole body as `text/plain` (visible 2026-04-28
+    /// on a Thunderbird-Android-encrypted mail: `kano1.eml`).
+    static func rewriteLineEndings(_ data: Data, to eol: Data) -> Data {
+        var out = Data()
+        out.reserveCapacity(data.count + data.count / 32)
+        var i = data.startIndex
+        while i < data.endIndex {
+            let byte = data[i]
+            switch byte {
+            case 0x0D:                              // CR (or CRLF)
+                out.append(eol)
+                let next = data.index(after: i)
+                if next < data.endIndex && data[next] == 0x0A {
+                    i = data.index(after: next)
+                } else {
+                    i = next
+                }
+            case 0x0A:                              // bare LF
+                out.append(eol)
+                i = data.index(after: i)
+            default:
+                out.append(byte)
+                i = data.index(after: i)
+            }
+        }
+        return out
+    }
+
     /// Build the inner MIME part from an RFC 822 message: lift the
     /// Content-* headers down with the body, drop the outer-only
     /// envelope headers (From / To / Subject / Date / Message-ID
@@ -354,9 +389,19 @@ enum PGPMimeBuilder {
         }
         appendHeader(into: &out, name: "MIME-Version", value: "1.0", eol: eol)
 
-        // 3. Single blank line, then the inner part's body.
+        // 3. Single blank line, then the inner part's body — with
+        //    line endings rewritten to match `eol`. PGP/MIME bodies
+        //    come back from `tclig --decrypt` in canonical CRLF form
+        //    (RFC 3156); the outer envelope (built from
+        //    `MEMessage.rawData`) is LF-only because Mail strips CR
+        //    before invoking `decodedMessage(forMessageData:)`. A
+        //    mixed-eol assembled message confuses Mail's reader: it
+        //    can't match `\n--<boundary>\n` against the body's
+        //    `\r\n--<boundary>\r\n` and falls back to rendering the
+        //    whole body as `text/plain` — boundaries, inner headers,
+        //    and quoted-printable escapes show up as literal text.
         out.append(eol)
-        out.append(innerSplit.body)
+        out.append(rewriteLineEndings(innerSplit.body, to: eol))
         return out
     }
 

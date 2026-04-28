@@ -49,6 +49,37 @@ enum PGPMimeParserError: Error, LocalizedError {
 
 enum PGPMimeParser {
 
+    /// Cheap precheck: does this RFC 822 message contain the textual
+    /// markers of a PGP/MIME signed or encrypted body? Lets the common
+    /// case (a non-PGP message in the inbox) skip the full classify +
+    /// XPC round-trip — Mail's indexer calls `decodedMessage` on
+    /// EVERY received message during scan, so we MUST short-circuit
+    /// the boring 99% or we churn `tclig` for nothing.
+    ///
+    /// MUST scan the WHOLE message: an earlier prefix-only version
+    /// (8 KiB) silently rejected legitimately-signed mail routed
+    /// through Microsoft 365 / Exchange, where the ARC + DKIM +
+    /// `x-ms-*` + `x-microsoft-antispam-messagedata-*` header pile
+    /// alone exceeds 8 KiB and pushes the outer
+    /// `Content-Type: multipart/signed` line past the cutoff
+    /// (observed 2026-04-28 with `jocar1.eml`). The `O(n)` byte scan
+    /// is cheap; the savings vs. spawning `tclig` come from skipping
+    /// the XPC round-trip, not from how little we look at.
+    ///
+    /// Lossy UTF-8 decode (replaces invalid bytes; never fails) so
+    /// we can use the standard case-insensitive `range(of:options:)`
+    /// search — RFC 2045 §5.1 mandates case-insensitive matching for
+    /// MIME type/subtype tokens.
+    static func hasPGPMarkers(in data: Data) -> Bool {
+        let s = String(decoding: data, as: UTF8.self)
+        let opts: String.CompareOptions = [.caseInsensitive, .literal]
+        let signed = s.range(of: "multipart/signed", options: opts) != nil
+            && s.range(of: "application/pgp-signature", options: opts) != nil
+        let encrypted = s.range(of: "multipart/encrypted", options: opts) != nil
+            && s.range(of: "application/pgp-encrypted", options: opts) != nil
+        return signed || encrypted
+    }
+
     /// Classify a top-level RFC 822 message.
     static func classify(_ raw: Data) -> InboundClassification {
         do {

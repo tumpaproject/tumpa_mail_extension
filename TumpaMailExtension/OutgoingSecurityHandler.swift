@@ -124,9 +124,6 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
     private var preferredDigest: String {
         sharedDefaults?.string(forKey: TumpaMailDefaults.defaultDigest) ?? "SHA256"
     }
-    private var configuredDefaultSigner: String? {
-        sharedDefaults?.string(forKey: TumpaMailDefaults.defaultSignerFingerprint)
-    }
 
     // MARK: - MEMessageEncoder (outgoing)
 
@@ -140,19 +137,18 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             .compactMap { $0.addressString }
 
         log.info("getEncodingStatus from=\(from, privacy: .public) recipients=\(recipients, privacy: .public)")
-        let storedDefault = configuredDefaultSigner ?? "<nil>"
-        log.info("configuredDefaultSigner=\(storedDefault, privacy: .public) sharedDefaultsAvailable=\(self.sharedDefaults != nil)")
 
         Task {
-            // Sign capability: we can sign iff we have a usable secret
-            // key for the From address (or the user has explicitly
-            // chosen a default signer that doesn't match From — we
-            // still sign with it).
+            // Sign capability: we can sign iff the From address
+            // resolves to a secret key in the keystore. A single Mail
+            // install can host multiple accounts, so the choice of
+            // signing key MUST follow the message's From header — not
+            // a global default.
             var canSign = false
             do {
                 let resolved = try await xpc.resolveRecipients([from])
                 log.info("resolveRecipients(from)=\(resolved, privacy: .public)")
-                canSign = resolved[from] != nil || configuredDefaultSigner != nil
+                canSign = resolved[from] != nil
             } catch {
                 log.error("resolveRecipients(from) failed: \(error.localizedDescription, privacy: .public)")
                 canSign = false
@@ -330,7 +326,7 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
     /// (empty `Data()`), since Mail's observer apparently force-
     /// unwraps that slot somewhere.
     func decodedMessage(forMessageData data: Data) -> MEDecodedMessage? {
-        log.info("decodedMessage called: rawSize=\(data.count) markers=\(self.hasPGPMarkers(in: data))")
+        log.info("decodedMessage called: rawSize=\(data.count) markers=\(PGPMimeParser.hasPGPMarkers(in: data))")
 
         // Fast path: messages we just encoded outbound carry a
         // tracking ID we already have a decoded result for. Hit the
@@ -346,7 +342,7 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             return cached
         }
 
-        guard hasPGPMarkers(in: data) else {
+        guard PGPMimeParser.hasPGPMarkers(in: data) else {
             return nil
         }
         let kind = PGPMimeParser.classify(data)
@@ -365,20 +361,6 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             log.info("decodedMessage classified as notPGP — returning nil")
             return nil
         }
-    }
-
-    /// Cheap precheck: scan the first ~8 KiB for PGP/MIME markers.
-    /// Lets the common case (a non-PGP message in the inbox) skip
-    /// classify+XPC entirely — Mail's indexer calls `decodedMessage`
-    /// on EVERY received message during scan, so we MUST short-circuit
-    /// the boring 99% or we churn tclig for nothing.
-    private func hasPGPMarkers(in data: Data) -> Bool {
-        let probe = data.prefix(8192)
-        guard let s = String(data: probe, encoding: .utf8)?.lowercased() else {
-            return false
-        }
-        return (s.contains("multipart/signed") && s.contains("application/pgp-signature"))
-            || (s.contains("multipart/encrypted") && s.contains("application/pgp-encrypted"))
     }
 
     private func decodeEncrypted(ciphertext: Data, original: Data) -> MEDecodedMessage? {
@@ -995,26 +977,29 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         return resolved[from]
     }
 
-    /// Pick a signing fingerprint: configured default first, else the
-    /// keystore key matching the From address. Returns `nil` when
-    /// signing isn't requested; throws when signing IS requested but
-    /// no key is available.
+    /// Pick a signing fingerprint by matching the message's From
+    /// address against the keystore. Returns `nil` when signing isn't
+    /// requested; throws when signing IS requested but no certificate
+    /// in the keystore has a UID for the From address.
+    ///
+    /// `xpc.resolveRecipients` matches against all certs (public or
+    /// secret), so smartcard users — who keep only the public cert
+    /// in the keystore while the secret material lives on the card —
+    /// resolve correctly. tclig's sign path does card-first dispatch
+    /// then falls back to a software secret if present.
     private func resolveSignerFingerprint(
         message: MEMessage,
         sign: Bool
     ) async throws -> String? {
         if !sign { return nil }
 
-        if let configured = configuredDefaultSigner, !configured.isEmpty {
-            return configured
-        }
         let from = message.fromAddress.addressString ?? message.fromAddress.rawString
         let resolved = try await xpc.resolveRecipients([from])
         if let fp = resolved[from] {
             return fp
         }
         throw TumpaSendError.signing(
-            "No signing key found for \(from). Set a default signing key in Tumpa Mail → Keys."
+            "No OpenPGP certificate found for \(from). Import the certificate with `tcli import` (a public cert is enough if the secret lives on a smartcard)."
         )
     }
 

@@ -239,7 +239,6 @@ public let TumpaMailSharedSuite = "group.in.kushaldas.tumpamail"
 
 /// Shared `UserDefaults` keys.
 public enum TumpaMailDefaults {
-    public static let defaultSignerFingerprint = "defaultSignerFingerprint"
     public static let defaultDigest = "defaultDigest"
     public static let alwaysSign = "alwaysSign"
     public static let preferEncryptedReplies = "preferEncryptedReplies"

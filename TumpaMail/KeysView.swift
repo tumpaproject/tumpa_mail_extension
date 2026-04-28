@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Read-only key picker. Lists what `tclig --list-keys --with-colons`
-// returns. The user does key management in `tcli` (import / export /
-// generate); the host UI just shows what's there and lets the user
-// pick a default signing key.
+// Read-only, informational key list. Shows what
+// `tclig --list-keys --with-colons` returns. The user does key
+// management in `tcli` (import / export / generate); the host UI
+// just shows what's there. Signing-key selection is automatic —
+// outgoing messages are signed with the keystore key whose UID
+// matches the message's From address.
 
 import SwiftUI
 
@@ -19,14 +21,6 @@ struct KeysView: View {
     @State private var keys: [TumpaKeyInfo] = []
     @State private var loadingError: String?
     @State private var loading = true
-    // Stored in the App Group suite so the sandboxed .appex sees the
-    // same value. `UserDefaults.standard` would only live in the host
-    // process and the extension would never read it.
-    @AppStorage(
-        TumpaMailDefaults.defaultSignerFingerprint,
-        store: UserDefaults(suiteName: TumpaMailSharedSuite)
-    )
-    private var defaultSigner: String = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -69,26 +63,12 @@ struct KeysView: View {
         .task { await load() }
     }
 
-    /// One row in the Keys list. Click anywhere on the leading icon
-    /// or the "Set as default" link to toggle. Whole row is also
-    /// click-friendly via `.contentShape(.rect)` so users don't have
-    /// to pixel-hunt the icon.
+    /// One row in the Keys list. Informational only — outgoing mail
+    /// is signed with whichever key's UID matches the From address,
+    /// so there's no per-row picker.
     @ViewBuilder
     private func keyRow(_ key: TumpaKeyInfo) -> some View {
-        let isDefault = key.fingerprint == defaultSigner
-        let disabled = key.isRevoked || key.isExpired
-
         HStack(alignment: .center, spacing: 14) {
-            Button {
-                defaultSigner = isDefault ? "" : key.fingerprint
-            } label: {
-                Image(systemName: isDefault ? "checkmark.circle.fill" : "circle")
-                    .imageScale(.large)
-                    .foregroundStyle(isDefault ? Color.accentColor : .secondary)
-            }
-            .buttonStyle(.plain)
-            .disabled(disabled)
-
             VStack(alignment: .leading, spacing: 2) {
                 Text(key.primaryUid).font(.body)
                 Text(key.fingerprint)
@@ -103,8 +83,6 @@ struct KeysView: View {
                 Text("revoked").foregroundStyle(.red)
             } else if key.isExpired {
                 Text("expired").foregroundStyle(.orange)
-            } else if isDefault {
-                Text("default signer").foregroundStyle(Color.accentColor)
             }
         }
         .padding(.vertical, 4)
