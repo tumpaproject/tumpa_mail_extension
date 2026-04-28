@@ -124,6 +124,14 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
     private var preferredDigest: String {
         sharedDefaults?.string(forKey: TumpaMailDefaults.defaultDigest) ?? "SHA256"
     }
+    /// "Sign every outgoing message by default" — host UI toggle in
+    /// Settings. When true, encode() opts the message into signing
+    /// even if Mail's compose UI didn't toggle Sign, BUT only when
+    /// the From address has a key in the keystore (best-effort: a
+    /// missing key for that account must NOT fail the send).
+    private var alwaysSignPreference: Bool {
+        sharedDefaults?.bool(forKey: TumpaMailDefaults.alwaysSign) ?? false
+    }
 
     // MARK: - MEMessageEncoder (outgoing)
 
@@ -192,22 +200,17 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         composeContext: MEComposeContext,
         completionHandler: @escaping (MEMessageEncodingResult) -> Void
     ) {
-        let shouldSign = composeContext.shouldSign
+        let userRequestedSign = composeContext.shouldSign
         let shouldEncrypt = composeContext.shouldEncrypt
+        let alwaysSign = alwaysSignPreference
 
-        log.info("encode shouldSign=\(shouldSign) shouldEncrypt=\(shouldEncrypt) rawSize=\(message.rawData?.count ?? -1)")
+        log.info("encode userRequestedSign=\(userRequestedSign) shouldEncrypt=\(shouldEncrypt) alwaysSignPref=\(alwaysSign) rawSize=\(message.rawData?.count ?? -1)")
 
-        // Diagnostic dump: when set true, writes both the original
-        // (Mail-supplied) and the encoded RFC 822 bytes to the
-        // .appex's tmp directory so the bytes survive a Mail crash
-        // for post-mortem. Off in shipping builds — flip to true
-        // locally when iterating on encode/decode shape problems.
-        let DIAG_DUMP = false
-
-        // Nothing to do — return a no-op result. Per
-        // MEMessageEncodingResult docs, an `encodedMessage` of nil
-        // with no errors means "the message did not need encoding".
-        if !shouldSign && !shouldEncrypt {
+        // Fast path: when none of {compose-UI Sign, compose-UI
+        // Encrypt, alwaysSign preference} is on, there's nothing
+        // for us to do. Skip the Task hop and the auto-save / cache
+        // checks below.
+        if !userRequestedSign && !shouldEncrypt && !alwaysSign {
             completionHandler(MEMessageEncodingResult(
                 encodedMessage: nil,
                 signingError: nil,
@@ -215,6 +218,13 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             ))
             return
         }
+
+        // Diagnostic dump: when set true, writes both the original
+        // (Mail-supplied) and the encoded RFC 822 bytes to the
+        // .appex's tmp directory so the bytes survive a Mail crash
+        // for post-mortem. Off in shipping builds — flip to true
+        // locally when iterating on encode/decode shape problems.
+        let DIAG_DUMP = false
 
         // Skip encode() for Mail's auto-saved drafts. Mail invokes
         // encode() up to 3× per logical message (auto-save → real
@@ -253,6 +263,38 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         }
 
         Task {
+            // Honor the "Sign every outgoing message by default"
+            // preference: if Mail's compose UI didn't toggle Sign but
+            // the preference is on AND the From address has a usable
+            // key, opt the message into signing. Best-effort: a
+            // missing key for this account must NOT fail the send —
+            // some accounts (work webmail, throwaways) won't have a
+            // PGP identity, and forcing the user to disable the
+            // preference per-account would be hostile.
+            var shouldSign = userRequestedSign
+            if alwaysSign && !shouldSign {
+                let from = message.fromAddress.addressString ?? message.fromAddress.rawString
+                let resolved = (try? await self.xpc.resolveRecipients([from])) ?? [:]
+                if resolved[from] != nil {
+                    shouldSign = true
+                    log.info("encode: alwaysSign opted into signing for from=\(from, privacy: .public)")
+                } else {
+                    log.info("encode: alwaysSign requested but no key for from=\(from, privacy: .public) — sending unsigned")
+                }
+            }
+
+            // Nothing to do — return a no-op result. Per
+            // MEMessageEncodingResult docs, an `encodedMessage` of nil
+            // with no errors means "the message did not need encoding".
+            if !shouldSign && !shouldEncrypt {
+                completionHandler(MEMessageEncodingResult(
+                    encodedMessage: nil,
+                    signingError: nil,
+                    encryptionError: nil
+                ))
+                return
+            }
+
             do {
                 let encoded = try await applyOpenPGP(
                     rawMessage: raw,
