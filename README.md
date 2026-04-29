@@ -1,109 +1,159 @@
 # Tumpa Mail
 
-Apple Mail extension that adds OpenPGP (PGP/MIME, RFC 3156) backed by the
-`tumpa-cli` keystore and the running `tcli` agent.
+OpenPGP for Apple Mail. Sign, encrypt, verify and decrypt email
+without leaving Mail.app.
 
-The deliverable is a single notarized DMG that drops `Tumpa Mail.app`
-into `/Applications`. `tumpa-cli` itself is **not** bundled — install
-it separately via Homebrew (`brew install tumpa-cli`, ≥ 0.5.0).
+Tumpa Mail is a [MailKit extension](https://developer.apple.com/documentation/mailkit)
+— it plugs into Apple Mail and adds PGP/MIME (RFC 3156) support
+alongside Mail's built-in S/MIME. Your keys are managed by
+[tumpa-cli](https://github.com/tumpaproject/tumpa-cli); Tumpa Mail
+itself is just the bridge that lets Apple Mail use them.
 
-## Architecture
+## Requirements
 
-```
-Apple Mail.app
-└── PlugIns/TumpaMailExtension.appex     (sandboxed by Apple)
-        │
-        │ NSXPCConnection(serviceName: "in.kushaldas.tumpamail.crypto")
-        ▼
-Tumpa Mail.app
-├── MacOS/TumpaMail                       (SwiftUI UI: status, key picker)
-└── XPCServices/TumpaCryptoXPC.xpc        (unsandboxed; spawns tclig)
-        │
-        ▼
-    /opt/homebrew/bin/tclig                (from Homebrew)
-        │
-        ▼
-    ~/.tumpa/keys.db + agent.sock + PCSC card
-```
+- macOS Sequoia 15.x or Tahoe 26.x
+- [tumpa-cli](https://github.com/tumpaproject/tumpa-cli) installed via
+  Homebrew. The `tcli` agent (`brew services start tumpa-cli`) caches
+  unlocked passphrases and PINs so you don't re-type them per
+  message.
+- A smartcard (YubiKey, Nitrokey) is supported but optional —
+  software-only OpenPGP keys work too.
 
-The `.appex` is hard-sandboxed by Apple's MailKit runtime — it cannot
-spawn processes, open `~/.tumpa/agent.sock`, or talk to PCSC. All crypto
-is done by **TumpaCryptoXPC**, an embedded XPC service that runs
-unsandboxed and is the only place `tclig` is invoked. The host UI and
-the `.appex` both reach it via `NSXPCConnection(serviceName:)`.
+## Install
 
-## Phase status
+A signed and notarized DMG is the supported install path. Drop
+`Tumpa Mail.app` into `/Applications`, then in Apple Mail:
 
-| Phase | Status   | Notes |
-|-------|----------|-------|
-| 0     | ✅ done  | `tumpa-cli` 0.5.0 + `libtumpa` 0.2.4 + `wecanencrypt` 0.14.2 ship `--digest-algo`, `--clearsign`, `--sign`, `--decrypt --verify-decrypt`, `INV_RECP` lines, `decrypt_and_verify`, `sign_and_encrypt_to_multiple`. |
-| 1     | ✅ done  | XPC contract, `TclibRunner`, status-line parser, host UI shell. `.appex` is a placeholder that loads but doesn't yet handle messages. |
-| 2     | ⏳ todo  | `MEMessageSecurityHandler` (outgoing sign/encrypt) + `PGPMimeBuilder`. |
-| 3     | ⏳ todo  | `MEMessageDecoder` (incoming decrypt/verify) + `PGPMimeParser`. |
-| 4     | partial | Welcome / Status / Keys / Settings panes are scaffolded. |
-| 5     | ⏳ todo  | DMG packaging script (`scripts/build-dmg.sh`) — see stub. |
+1. Open Mail → **Settings** → **Extensions**.
+2. Enable **Tumpa Mail** under **Mail Extensions**.
 
-## Building locally (developer flow)
+That's it. Apple Mail will load the extension on next message open
+and on every compose.
 
-Prerequisites: macOS 12+, Xcode 15+, Homebrew, `xcodegen`.
+If you want to build from source (developer flow), see
+[CLAUDE.md](./CLAUDE.md).
+
+## Setting up your keys
+
+Tumpa Mail does not generate or import keys itself — that work
+belongs to `tumpa-cli`. From a terminal:
 
 ```bash
-brew install xcodegen
-brew install tumpa-cli                         # ≥ 0.5.0
-brew services start tumpa-cli
+# Generate a new key
+tcli generate --uid "Alice <alice@example.com>"
 
-cd tumpa_mail_extension
-xcodegen generate
-open TumpaMail.xcodeproj                       # set DEVELOPMENT_TEAM
-xcodebuild -scheme TumpaMail -configuration Debug build
+# Or import an existing one
+tcli import alice-secret.asc
+
+# Confirm Tumpa Mail can see it
+tcli list
 ```
 
-Then install the built `.app`:
+Keys live in `~/.tumpa/keys.db`. Tumpa Mail reads the same database
+through the agent.
 
-```bash
-cp -R build/Debug/TumpaMail.app /Applications/
-open /Applications/TumpaMail.app               # registers the .appex with Mail
-# Mail → Settings → Extensions → enable "Tumpa Mail"
-```
+## Daily use
 
-## Building the release DMG
+### Sending mail
 
-```bash
-export DEVELOPMENT_TEAM=YOUR_TEAM_ID
-export NOTARY_PROFILE=tumpa-notarize           # configured via `xcrun notarytool store-credentials`
-./scripts/build-dmg.sh
-```
+Compose a message in Apple Mail. The compose toolbar shows two
+buttons next to the recipient field:
 
-Result: `dist/TumpaMail-<version>.dmg`, signed and notarized.
+- **Sign** — attaches a PGP/MIME signature.
+- **Encrypt** — encrypts to every recipient who has a public key in
+  your keystore. Recipients without a key are flagged with a red
+  dot in the chip; if any recipient is unresolvable, encryption is
+  blocked until you remove or import their key.
 
-## Layout
+Enable either or both, then **Send**. The first time you sign or
+encrypt in a session, Tumpa Mail prompts for your key passphrase or
+smartcard PIN inside Mail's window (see below). The unlocked secret
+is cached by the `tcli` agent for the rest of the session, so
+subsequent messages don't re-prompt.
 
-```
-tumpa_mail_extension/
-├── project.yml                  # XcodeGen input
-├── README.md                    # this file
-├── scripts/
-│   └── build-dmg.sh             # release packaging
-├── Shared/
-│   └── TumpaCryptoXPC.swift     # @objc protocol + Codable models
-├── TumpaMail/                   # host app (SwiftUI)
-│   ├── TumpaMailApp.swift
-│   ├── WelcomeView.swift
-│   ├── StatusView.swift
-│   ├── KeysView.swift
-│   ├── SettingsView.swift
-│   ├── XPCClient.swift
-│   ├── Info.plist
-│   └── TumpaMail.entitlements
-├── TumpaCryptoXPC/              # XPC service (unsandboxed, spawns tclig)
-│   ├── main.swift
-│   ├── TumpaCryptoService.swift
-│   ├── TclibRunner.swift
-│   ├── StatusLineParser.swift
-│   ├── Info.plist
-│   └── TumpaCryptoXPC.entitlements
-└── TumpaMailExtension/          # MailKit extension (.appex, sandboxed)
-    ├── Placeholder.swift        # → real handlers in Phase 2 / 3
-    ├── Info.plist
-    └── TumpaMailExtension.entitlements
-```
+### Reading mail
+
+Encrypted and signed inbound messages are decoded automatically.
+Click the security shield in the message header to see who signed,
+which key it was encrypted to, and whether the signature verified.
+
+If a message is encrypted to a key Tumpa Mail hasn't unlocked yet,
+the body shows a placeholder ("This message is encrypted to your
+OpenPGP key — click the security shield to enter your passphrase"),
+and a banner appears at the top with an **Unlock** button. Either
+route opens the unlock dialog.
+
+### Unlocking your key
+
+When Tumpa Mail needs your passphrase or smartcard PIN, a SwiftUI
+form appears inside Mail's window with the key UID and fingerprint
+already filled in. Type the secret, click **Unlock**.
+
+Tumpa Mail does **not** cache the secret directly. It first runs a
+quick test signature to confirm the secret is correct; only then
+does it hand the verified secret to the `tcli` agent for caching.
+This protects smartcards: a wrong PIN typed once consumes one card
+attempt counter slot, not the cascade Apple Mail's library indexer
+would otherwise trigger.
+
+After a successful unlock:
+
+- The popover shows "Unlocked — click the message again to decrypt
+  it."
+- The next message you click opens decrypted; the agent serves the
+  cached secret.
+- All other messages encrypted to the same key auto-decrypt for the
+  rest of the agent session.
+
+The agent forgets cached secrets when you stop it
+(`brew services stop tumpa-cli`) or reboot.
+
+## Privacy and security
+
+- Your private keys never leave `~/.tumpa/keys.db` and your
+  smartcard never has its PIN stored on disk.
+- Tumpa Mail does not phone home, send telemetry, or contact any
+  Tumpa-operated service. The only network traffic is the one Mail
+  itself makes to send and fetch your email.
+- The MailKit extension is sandboxed by Apple's runtime. All crypto
+  runs in a separate XPC service that links libtumpa directly — no
+  shell processes, no temp files for plaintext.
+- Smartcard PINs and software passphrases are wrapped in
+  `Zeroizing` containers throughout the Rust code; key material is
+  zeroed on drop.
+
+## Compatibility
+
+Tumpa Mail produces standard PGP/MIME (RFC 3156) and verifies
+against the same. Tested receivers:
+
+- Thunderbird (built-in OpenPGP)
+- gpg / GPG Suite
+- Tumpa Mail itself
+
+Inbound HTML and `multipart/alternative` messages are decoded but
+have not been exhaustively round-tripped against every sender —
+file an issue if you see a render glitch.
+
+## Reporting issues
+
+Issues, feature requests, and crash reports go to the
+[Tumpa Mail GitHub issues](https://github.com/tumpaproject/tumpa-mail/issues).
+
+When reporting a decryption or verification problem, include:
+
+- macOS version and Mail.app version
+- Tumpa Mail version (Mail → Settings → Extensions shows it)
+- Output of `tcli --version`
+- A live log capture taken while reproducing:
+  ```bash
+  log stream --predicate 'subsystem CONTAINS "in.kushaldas.tumpamail"' --info
+  ```
+
+Do **not** include your private key, your passphrase, or the
+plaintext of any encrypted message. Logs are designed not to leak
+those — they show fingerprints and key IDs but no secret material.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](./LICENSE).
