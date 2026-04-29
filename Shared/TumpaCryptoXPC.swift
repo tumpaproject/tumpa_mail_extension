@@ -4,11 +4,11 @@
 // crypto-bearing XPC service bundle that lives inside the host app.
 //
 // Why an XPC service: the .appex is hard-sandboxed by Apple's MailKit
-// runtime — it cannot spawn `tclig`, open `~/.tumpa/agent.sock`, or
-// touch PCSC. The XPC service runs unsandboxed (or with a permissive
-// sandbox + temporary-exception entitlements), and is the only place
-// `tclig` is invoked. The host app UI uses the same XPC service for
-// `listKeys` / `tcligVersion` so there's one path to the crypto.
+// runtime — it cannot open `~/.tumpa/agent.sock`, touch PCSC, or
+// spawn `pinentry-mac`. The XPC service runs unsandboxed and is the
+// only place libtumpa (linked in via UniFFI) is called. The host
+// app UI uses the same XPC service for `listKeys` so there's one
+// path to the crypto.
 //
 // All `Data` payloads are raw bytes — armored OpenPGP for signatures /
 // ciphertext, UTF-8 text or binary for plaintext. The protocol does
@@ -53,10 +53,12 @@ public protocol TumpaCryptoXPC {
     /// passphrase via pinentry). Same reply shape for both backends.
     ///
     /// On per-recipient resolution failure the reply carries the
-    /// invalid recipient identifiers in `invalidRecipients` (parsed
-    /// from `tclig`'s `[GNUPG:] INV_RECP` status lines) so the compose
-    /// UI can show "no key for X" inline. When at least one recipient
-    /// is invalid, `armoredCiphertext` is `nil` and `error` is set.
+    /// invalid recipient identifiers in `invalidRecipients` (the
+    /// typed `TumpaError.invalidRecipients` variant from libtumpa,
+    /// preserving what was previously parsed from `[GNUPG:] INV_RECP`
+    /// status lines) so the compose UI can show "no key for X"
+    /// inline. When at least one recipient is invalid,
+    /// `armoredCiphertext` is `nil` and `error` is set.
     func encrypt(
         plaintext: Data,
         recipientFingerprints: [String],
@@ -64,6 +66,9 @@ public protocol TumpaCryptoXPC {
         armor: Bool,
         reply: @escaping (_ armoredCiphertext: Data?,
                           _ invalidRecipients: [String],
+                          _ needsUnlockFingerprint: String?,
+                          _ needsUnlockUid: String?,
+                          _ needsUnlockIsPin: Bool,
                           _ error: NSError?) -> Void
     )
 
@@ -95,6 +100,9 @@ public protocol TumpaCryptoXPC {
                           _ signerFingerprint: String?,
                           _ signerKeyId: String?,
                           _ signerUid: String?,
+                          _ needsUnlockFingerprint: String?,
+                          _ needsUnlockUid: String?,
+                          _ needsUnlockIsPin: Bool,
                           _ error: NSError?) -> Void
     )
 
@@ -143,21 +151,41 @@ public protocol TumpaCryptoXPC {
                           _ error: NSError?) -> Void
     )
 
-    // MARK: - Health
+    // MARK: - Agent cache (in-Mail unlock flow)
 
-    /// Probe `tclig --version`. Reply is the version string
-    /// (e.g. `"tclig 0.5.0"`) or an error if the binary is absent /
-    /// too old. The host app uses this to refuse to start if a
-    /// `tumpa-cli < 0.5.0` is on `PATH`.
-    func tcligVersion(
-        reply: @escaping (_ version: String?,
-                          _ error: NSError?) -> Void
+    /// Write `secret` into the tumpa agent cache at
+    /// `~/.tumpa/agent.sock` under the slot determined by `isPin`
+    /// (`pin:<fp>` for smartcard PINs, `passphrase:<fp>` for
+    /// software-key passphrases). Same namespacing tcli /
+    /// tpass / tclig use, so once the popover writes here every
+    /// subsequent crypto op (Mail extension, host UI, or any other
+    /// tumpa client) reuses the cached secret.
+    ///
+    /// Reply `success: false` means the agent isn't running or
+    /// rejected the request — the .appex's popover surfaces that as
+    /// an error so the user can re-launch the agent and retry.
+    ///
+    /// The .appex is sandboxed and CANNOT reach the agent socket
+    /// directly; this XPC method is the only path for the .appex's
+    /// in-Mail unlock UI to populate the cache.
+    func cachePassphrase(
+        fingerprint: String,
+        isPin: Bool,
+        secret: Data,
+        reply: @escaping (_ success: Bool, _ error: NSError?) -> Void
     )
+
+    // MARK: - Health
 
     /// Whether `~/.tumpa/agent.sock` exists right now. Drives the
     /// host's StatusView "Agent" indicator. The host UI is sandboxed
     /// and can't reach the user's home directory itself, so the
     /// (unsandboxed) XPC service does the `fileExists` probe.
+    ///
+    /// Note: `tcligVersion` was removed when the XPC service stopped
+    /// spawning `tclig` and started linking libtumpa directly via
+    /// UniFFI. There is no separate `tclig` binary to version-check
+    /// anymore — the crypto code is part of the XPC binary itself.
     func agentSocketExists(
         reply: @escaping (_ exists: Bool) -> Void
     )

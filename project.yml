@@ -140,6 +140,39 @@ targets:
         CODE_SIGN_ENTITLEMENTS: TumpaCryptoXPC/TumpaCryptoXPC.entitlements
         INFOPLIST_FILE: TumpaCryptoXPC/Info.plist
         ENABLE_APP_SANDBOX: NO
+        # Static-link the libtumpa UniFFI bindings. The .a is a
+        # universal (aarch64 + x86_64) archive produced by
+        # `just rust` (scripts/build-rust-staticlib.sh). The linker
+        # collapses it into the XPC binary's single Mach-O so the
+        # bundle layout / post-build rehome / re-sign in the
+        # TumpaMail target stays untouched.
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/../tumpa-uniffi/target/universal-apple-darwin/release
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - -ltumpa_uniffi
+          # libtumpa's smartcard path links these macOS frameworks
+          # transitively via PCSC; spell them out so xcodebuild
+          # passes them to the linker even though they're not
+          # surfaced through Cargo's metadata.
+          - -framework
+          - PCSC
+          - -framework
+          - Security
+          - -framework
+          - CoreFoundation
+        # The generated `tumpaFFI.modulemap` exposes the C header to
+        # Swift as a clang module the binding's tumpa.swift can
+        # `import tumpaFFI`. Swift discovers it via the explicit
+        # -fmodule-map-file flag passed through to clang.
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/TumpaCryptoXPC/Generated
+        OTHER_SWIFT_FLAGS:
+          - $(inherited)
+          - -Xcc
+          - -fmodule-map-file=$(SRCROOT)/TumpaCryptoXPC/Generated/tumpaFFI.modulemap
 
   # ---------------------------------------------------------------
   # MailKit extension (.appex). Sandboxed by Apple's MailKit runtime;
@@ -177,10 +210,35 @@ targets:
       - path: Tests
       - path: TumpaMailExtension/PGPMimeBuilder.swift
       - path: TumpaMailExtension/PGPMimeParser.swift
-      - path: TumpaCryptoXPC/StatusLineParser.swift
       - path: Shared/TumpaCryptoXPC.swift
+      # Compile the libtumpa-binding-using files into the test bundle
+      # so LibtumpaRunnerTests can exercise the FFI in-process.
+      - path: TumpaCryptoXPC/LibtumpaRunner.swift
+      - path: TumpaCryptoXPC/SecretProvider.swift
+      - path: TumpaCryptoXPC/Generated
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: in.kushaldas.tumpamail.tests
         GENERATE_INFOPLIST_FILE: YES
         CODE_SIGN_STYLE: Automatic
+        # Same link / module-map plumbing as TumpaCryptoXPC, so the
+        # test bundle's own binary carries libtumpa_uniffi.
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/../tumpa-uniffi/target/universal-apple-darwin/release
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - -ltumpa_uniffi
+          - -framework
+          - PCSC
+          - -framework
+          - Security
+          - -framework
+          - CoreFoundation
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/TumpaCryptoXPC/Generated
+        OTHER_SWIFT_FLAGS:
+          - $(inherited)
+          - -Xcc
+          - -fmodule-map-file=$(SRCROOT)/TumpaCryptoXPC/Generated/tumpaFFI.modulemap

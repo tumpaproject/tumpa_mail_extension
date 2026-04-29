@@ -22,9 +22,18 @@ enum XPCClientError: Error, LocalizedError {
     case connectionInvalidated
     case remote(String)
     case noResult
+    /// libtumpa needed a passphrase / PIN that wasn't in the agent
+    /// cache. The .appex's `OutgoingSecurityHandler` translates this
+    /// into a `TumpaSecurityContext.lockedWaiting` so Mail's
+    /// puzzle-piece popover prompts the user inline.
+    case needsUnlock(fingerprint: String, uid: String, isPin: Bool)
 
     var errorDescription: String? {
         switch self {
+        case .needsUnlock(_, let uid, let isPin):
+            return isPin
+                ? "Smartcard PIN required for \(uid)"
+                : "Passphrase required for \(uid)"
         case .connectionInvalidated:
             return "Connection to Tumpa Crypto XPC service was lost."
         case .remote(let msg):
@@ -40,6 +49,12 @@ enum XPCClientError: Error, LocalizedError {
 /// session, so the connection reuses across `getEncodingStatus` and
 /// `encode` calls.
 final class XPCClient {
+
+    /// Process-wide shared instance. The popover unlock flow uses
+    /// this so the SwiftUI view doesn't have to plumb an XPCClient
+    /// through `MEExtensionViewController` init. Fine to share — the
+    /// class internally does its own connection management with a lock.
+    static let shared = XPCClient()
 
     private var connection: NSXPCConnection?
     private let lock = NSLock()
@@ -105,14 +120,6 @@ final class XPCClient {
 
     // MARK: - Async wrappers
 
-    func tcligVersion() async throws -> String {
-        try await call { proxy, cont in
-            proxy.tcligVersion { v, e in
-                Self.resume(cont, v, e)
-            }
-        }
-    }
-
     func listKeys() async throws -> [TumpaKeyInfo] {
         try await call { proxy, cont in
             proxy.listKeys { keys, e in
@@ -173,9 +180,15 @@ final class XPCClient {
     ) {
         try await call { proxy, cont in
             proxy.decryptVerify(armoredCiphertext: ciphertext) {
-                pt, status, fp, kid, uid, e in
+                pt, status, fp, kid, uid, needsFp, needsUid, needsIsPin, e in
                 if let pt = pt {
                     cont.resume(returning: (pt, status, fp, kid, uid))
+                } else if let needsFp = needsFp, let needsUid = needsUid {
+                    cont.resume(throwing: XPCClientError.needsUnlock(
+                        fingerprint: needsFp,
+                        uid: needsUid,
+                        isPin: needsIsPin
+                    ))
                 } else if let e = e {
                     cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
                 } else {
@@ -225,15 +238,48 @@ final class XPCClient {
                 recipientFingerprints: recipientFingerprints,
                 signerFingerprint: signerFingerprint,
                 armor: armor
-            ) { ct, invalid, e in
-                if !invalid.isEmpty {
+            ) { ct, invalid, needsFp, needsUid, needsIsPin, e in
+                if let ct = ct {
+                    cont.resume(returning: ct)
+                } else if !invalid.isEmpty {
                     cont.resume(throwing: XPCClientError.remote(
                         "no usable key for: \(invalid.joined(separator: ", "))"
                     ))
+                } else if let needsFp = needsFp, let needsUid = needsUid {
+                    cont.resume(throwing: XPCClientError.needsUnlock(
+                        fingerprint: needsFp,
+                        uid: needsUid,
+                        isPin: needsIsPin
+                    ))
                 } else if let e = e {
                     cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
-                } else if let ct = ct {
-                    cont.resume(returning: ct)
+                } else {
+                    cont.resume(throwing: XPCClientError.noResult)
+                }
+            }
+        }
+    }
+
+    /// Write `secret` (the user-typed passphrase or PIN) into the
+    /// tumpa agent cache. Subsequent `decryptVerify` / `encrypt` /
+    /// `signDetached` calls hit the cache and complete without
+    /// re-prompting. Used by the in-Mail unlock popover after the
+    /// user submits.
+    func cachePassphrase(
+        fingerprint: String,
+        isPin: Bool,
+        secret: Data
+    ) async throws {
+        try await call { proxy, cont in
+            proxy.cachePassphrase(
+                fingerprint: fingerprint,
+                isPin: isPin,
+                secret: secret
+            ) { ok, e in
+                if ok {
+                    cont.resume(returning: ())
+                } else if let e = e {
+                    cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
                 } else {
                     cont.resume(throwing: XPCClientError.noResult)
                 }
@@ -259,20 +305,4 @@ final class XPCClient {
         }
     }
 
-    /// Resume a string-returning continuation given the typical
-    /// (value, error) reply shape. Hoisted into a helper because
-    /// `tcligVersion` is the only string-returning XPC method.
-    private static func resume(
-        _ cont: CheckedContinuation<String, Error>,
-        _ value: String?,
-        _ error: NSError?
-    ) {
-        if let v = value {
-            cont.resume(returning: v)
-        } else if let e = error {
-            cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
-        } else {
-            cont.resume(throwing: XPCClientError.noResult)
-        }
-    }
 }

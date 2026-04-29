@@ -73,20 +73,6 @@ final class XPCClient: ObservableObject {
 
     // MARK: - Typed async wrappers
 
-    func tcligVersion() async throws -> String {
-        try await withCheckedThrowingContinuation { cont in
-            do {
-                try proxy().tcligVersion { version, error in
-                    if let v = version { cont.resume(returning: v) }
-                    else if let e = error { cont.resume(throwing: XPCClientError.remote(e.localizedDescription)) }
-                    else { cont.resume(throwing: XPCClientError.connectionInvalidated) }
-                }
-            } catch {
-                cont.resume(throwing: error)
-            }
-        }
-    }
-
     func listKeys() async throws -> [TumpaKeyInfo] {
         try await withCheckedThrowingContinuation { cont in
             do {

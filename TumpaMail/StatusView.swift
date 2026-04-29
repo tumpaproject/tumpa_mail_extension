@@ -1,31 +1,35 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Diagnostic panel: probes the XPC service for `tclig` version,
-// agent socket reachability, and connected card. The user opens this
-// when something doesn't work to figure out which layer is broken.
+// Diagnostic panel: probes the XPC service for the agent socket and
+// keystore reachability. The user opens this when something doesn't
+// work to figure out which layer is broken.
+//
+// As of the libtumpa-via-UniFFI cutover, the crypto code is part of
+// the XPC binary itself — there is no separate `tclig` binary on
+// PATH to version-check. The "tumpa-cli on PATH" row is gone.
 
 import SwiftUI
 
 struct StatusView: View {
 
-    @State private var tcligVersion: String?
-    @State private var tcligError: String?
+    @State private var keyCount: Int?
+    @State private var keystoreError: String?
     @State private var agentSocketExists: Bool?
     @State private var loading = true
 
     var body: some View {
         Form {
-            Section("tumpa-cli") {
-                row(label: "tclig version",
-                    ok: tcligVersion != nil && tcligError == nil,
-                    detail: tcligVersion ?? tcligError ?? "checking…")
+            Section("Keystore") {
+                row(label: "~/.tumpa/keys.db",
+                    ok: keyCount != nil && keystoreError == nil,
+                    detail: detailForKeystore())
             }
             Section("Agent") {
                 row(label: "~/.tumpa/agent.sock",
                     ok: agentSocketExists == true,
                     detail: agentSocketExists == true
-                        ? "reachable"
-                        : "not running — `brew services start tumpa-cli`")
+                        ? "reachable — cached secrets will be reused"
+                        : "not running — passphrase / PIN prompts every op")
             }
             Section {
                 Button("Re-check") { Task { await refresh() } }
@@ -47,17 +51,26 @@ struct StatusView: View {
         }
     }
 
+    private func detailForKeystore() -> String {
+        if let err = keystoreError { return err }
+        if let n = keyCount {
+            return "\(n) key\(n == 1 ? "" : "s")"
+        }
+        return "checking…"
+    }
+
     @MainActor
     private func refresh() async {
         loading = true
         defer { loading = false }
 
         do {
-            tcligVersion = try await XPCClient.shared.tcligVersion()
-            tcligError = nil
+            let keys = try await XPCClient.shared.listKeys()
+            keyCount = keys.count
+            keystoreError = nil
         } catch {
-            tcligVersion = nil
-            tcligError = error.localizedDescription
+            keyCount = nil
+            keystoreError = error.localizedDescription
         }
 
         // Sandboxed host can't reach `~/.tumpa/`; the unsandboxed XPC

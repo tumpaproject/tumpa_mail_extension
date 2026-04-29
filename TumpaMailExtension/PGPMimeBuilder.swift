@@ -90,8 +90,8 @@ enum PGPMimeBuilder {
     ///
     /// `micalg` is the OpenPGP hash algorithm name lowercased and
     /// prefixed with `pgp-`, e.g. `pgp-sha256` for SHA-256. The
-    /// caller gets it from `TclibRunner.signDetached` /
-    /// `signDetached(canonicalizedBody:..)`.
+    /// caller gets it from `LibtumpaRunner.signDetached` (via the
+    /// XPC `signDetached(canonicalizedBody:...)` reply slot).
     ///
     /// The signed part the caller already detached-signed is the
     /// CRLF-canonicalized headers+body of the inner MIME. Pass that

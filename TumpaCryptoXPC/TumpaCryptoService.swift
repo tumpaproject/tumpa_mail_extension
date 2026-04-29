@@ -16,24 +16,40 @@ private let svcLog = Logger(
 
 final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
 
-    private let runner = TclibRunner()
+    private let runner = LibtumpaRunner()
     private let workQueue = DispatchQueue(label: "in.kushaldas.tumpamail.crypto.work",
                                           qos: .userInitiated,
                                           attributes: .concurrent)
 
-    // MARK: - Health
+    // MARK: - Agent cache (in-Mail unlock flow)
 
-    func tcligVersion(reply: @escaping (String?, NSError?) -> Void) {
+    func cachePassphrase(
+        fingerprint: String,
+        isPin: Bool,
+        secret: Data,
+        reply: @escaping (Bool, NSError?) -> Void
+    ) {
         workQueue.async {
-            do {
-                try self.runner.ensureVersionAtLeast(TumpaMailRequiredTcligVersion)
-                let v = try self.runner.version()
-                reply(v, nil)
-            } catch {
-                reply(nil, Self.nsError(error))
-            }
+            // Store in the IN-MEMORY transient slot, NOT the agent
+            // socket. Writing the popover-typed secret directly to
+            // `~/.tumpa/agent.sock` would cache it before any
+            // verification — and Mail's library indexer triggers
+            // many decryptVerify calls in succession, so a wrong
+            // PIN would burn N card attempts in a row and lock the
+            // card. The transient slot is consumed by the next
+            // libtumpa op; on success it gets promoted to the
+            // agent, on failure it's wiped (max one card attempt
+            // counter slot consumed per popover submission).
+            let cacheKey = isPin
+                ? TumpaAgentClient.pinKey(forFingerprint: fingerprint)
+                : TumpaAgentClient.passphraseKey(forFingerprint: fingerprint)
+            TumpaTransientStore.shared.put(cacheKey: cacheKey, secret: Array(secret))
+            svcLog.info("cachePassphrase queued in transient slot for \(cacheKey, privacy: .public)")
+            reply(true, nil)
         }
     }
+
+    // MARK: - Health
 
     func agentSocketExists(reply: @escaping (Bool) -> Void) {
         workQueue.async {
@@ -71,12 +87,11 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
         recipientFingerprints: [String],
         signerFingerprint: String?,
         armor: Bool,
-        reply: @escaping (Data?, [String], NSError?) -> Void
+        reply: @escaping (Data?, [String], String?, String?, Bool, NSError?) -> Void
     ) {
         workQueue.async {
-            let tcligPath = (try? self.runner.tcligURL().path) ?? "<unresolved>"
             svcLog.info(
-                "encrypt called — tclig=\(tcligPath, privacy: .public) plaintextSize=\(plaintext.count) recipients=\(recipientFingerprints, privacy: .public) signer=\(signerFingerprint ?? "<none>", privacy: .public) armor=\(armor)"
+                "encrypt called — plaintextSize=\(plaintext.count) recipients=\(recipientFingerprints, privacy: .public) signer=\(signerFingerprint ?? "<none>", privacy: .public) armor=\(armor)"
             )
             do {
                 let ct = try self.runner.encrypt(
@@ -86,15 +101,20 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
                     armor: armor
                 )
                 svcLog.info("encrypt OK — ciphertextSize=\(ct.count)")
-                reply(ct, [], nil)
-            } catch let TclibError.invalidRecipients(bad) {
+                reply(ct, [], nil, nil, false, nil)
+            } catch let LibtumpaError.invalidRecipients(bad) {
                 svcLog.error("encrypt FAILED with invalidRecipients=\(bad, privacy: .public)")
-                reply(nil, bad, Self.nsError(TclibError.invalidRecipients(bad)))
+                reply(nil, bad, nil, nil, false, Self.nsError(LibtumpaError.invalidRecipients(bad)))
+            } catch let LibtumpaError.secretUnavailable(fp, uid, isPin, _) {
+                svcLog.error("encrypt needs unlock for \(fp, privacy: .public) (isPin=\(isPin))")
+                reply(nil, [], fp, uid, isPin,
+                      Self.nsError(LibtumpaError.secretUnavailable(
+                        fingerprint: fp, uid: uid, isPin: isPin, message: "needs unlock")))
             } catch {
                 svcLog.error(
                     "encrypt FAILED — \(error.localizedDescription, privacy: .public) :: \(String(describing: error), privacy: .public)"
                 )
-                reply(nil, [], Self.nsError(error))
+                reply(nil, [], nil, nil, false, Self.nsError(error))
             }
         }
     }
@@ -103,7 +123,7 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
 
     func decryptVerify(
         armoredCiphertext: Data,
-        reply: @escaping (Data?, String, String?, String?, String?, NSError?) -> Void
+        reply: @escaping (Data?, String, String?, String?, String?, String?, String?, Bool, NSError?) -> Void
     ) {
         workQueue.async {
             do {
@@ -114,13 +134,26 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
                     out.signerFingerprint,
                     out.signerKeyId,
                     out.signerUid,
+                    nil,
+                    nil,
+                    false,
                     nil
+                )
+            } catch let LibtumpaError.secretUnavailable(fp, uid, isPin, _) {
+                svcLog.error("decryptVerify needs unlock for \(fp, privacy: .public) (isPin=\(isPin))")
+                reply(
+                    nil,
+                    TumpaSignatureStatus.unknown,
+                    nil, nil, nil,
+                    fp, uid, isPin,
+                    Self.nsError(LibtumpaError.secretUnavailable(
+                        fingerprint: fp, uid: uid, isPin: isPin, message: "needs unlock"))
                 )
             } catch {
                 // On decrypt failure we have no plaintext to surface
                 // the signature status against. Caller renders an
                 // error banner in the message viewer.
-                reply(nil, TumpaSignatureStatus.unknown, nil, nil, nil, Self.nsError(error))
+                reply(nil, TumpaSignatureStatus.unknown, nil, nil, nil, nil, nil, false, Self.nsError(error))
             }
         }
     }
@@ -167,25 +200,7 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
         workQueue.async {
             svcLog.info("resolveRecipients called with \(emails.count) email(s): \(emails, privacy: .public)")
             do {
-                let allKeys = try self.runner.listKeys()
-                svcLog.info("listKeys returned \(allKeys.count) key(s)")
-                var resolved: [String: String] = [:]
-                for email in emails {
-                    let lc = email.lowercased()
-                    // Walk keys, find one whose primary UID contains
-                    // the email exactly (case-insensitive). Prefer
-                    // secret-bearing keys when both exist (a sign of
-                    // "this is the user's own key", but UI wants
-                    // recipient resolution which works fine either
-                    // way — first match wins).
-                    if let match = allKeys.first(where: { key in
-                        !key.isRevoked
-                            && !key.isExpired
-                            && key.primaryUid.lowercased().contains("<\(lc)>")
-                    }) {
-                        resolved[email] = match.fingerprint
-                    }
-                }
+                let resolved = try self.runner.resolveRecipients(emails: emails)
                 svcLog.info("resolveRecipients result: \(resolved, privacy: .public)")
                 reply(resolved, nil)
             } catch {

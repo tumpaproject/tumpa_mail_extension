@@ -38,13 +38,29 @@ default:
 icons:
     "{{project_dir}}/scripts/render-icons.sh"
 
+# Build the universal (aarch64 + x86_64) libtumpa_uniffi.a that the
+# XPC service links against. Required before `just build` on a fresh
+# checkout. The .a is NOT committed — `just rust` is what produces it.
+rust:
+    "{{project_dir}}/scripts/build-rust-staticlib.sh"
+
+# Regenerate the Swift binding files (TumpaCryptoXPC/Generated/) from
+# the Rust crate. The output IS committed to the repo so a fresh
+# checkout doesn't need uniffi-bindgen — only run this when the Rust
+# API surface (signatures / new exports / type changes) actually
+# changes.
+bindings:
+    "{{project_dir}}/scripts/regen-uniffi-bindings.sh"
+
 # Regenerate TumpaMail.xcodeproj from project.yml.
 generate:
     @command -v xcodegen >/dev/null || { echo "error: xcodegen not installed (brew install xcodegen)"; exit 1; }
     cd "{{project_dir}}" && xcodegen generate
 
-# Release build of the host app + XPC service + .appex.
-build: generate
+# Release build of the host app + XPC service + .appex. Depends on
+# `rust` so the universal libtumpa_uniffi.a exists for the XPC
+# service to link against.
+build: rust generate
     rm -rf "{{build_dir}}"
     xcodebuild \
       -project "{{xcodeproj}}" \
@@ -53,8 +69,10 @@ build: generate
       -derivedDataPath "{{build_dir}}" \
       build
 
-# Run the PGPMimeBuilder / PGPMimeParser unit tests.
-test: generate
+# Run the PGPMimeBuilder / PGPMimeParser / LibtumpaRunner tests.
+# Depends on `rust` so the static lib the XPC sources transitively
+# pull in (via shared types) is available.
+test: rust generate
     xcodebuild \
       -project "{{xcodeproj}}" \
       -scheme TumpaMailTests \

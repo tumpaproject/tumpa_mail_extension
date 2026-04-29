@@ -5,6 +5,15 @@
 // lands here via the `context: Data` slot we set on
 // `MEDecodedMessage` / `MEMessageSigner` — JSON-encoded, decoded back
 // on click. Modeled after MailGPG's SecurityDetailView.
+//
+// Beyond the read-only signer/encrypted info, this view ALSO drives
+// the in-Mail unlock flow: when libtumpa needed a passphrase / PIN
+// that wasn't in the agent cache, the .appex parks a
+// `TumpaSecurityContext` with `.lockedWaiting` here. We render a
+// SecureField, the user types, we call back to the XPC service to
+// write the secret into `~/.tumpa/agent.sock`, and the user clicks
+// the message again to redecode (Mail caches MEDecodedMessage and
+// won't auto-redecode without re-selecting).
 
 import AppKit
 import MailKit
@@ -21,6 +30,13 @@ struct TumpaSecurityContext: Codable {
         case signedUnknown   // signer's public key not in the keystore
         case signedBad       // signature did not verify
         case decryptFailed
+        /// Decryption can't proceed because libtumpa's
+        /// `SecretProvider` had nothing in the agent cache and no
+        /// `TUMPA_PASSPHRASE` env var. The popover renders a
+        /// SecureField; on submit we write to the agent and the user
+        /// re-selects the message. `fingerprint` and `signerLabel`
+        /// (UID) identify which key needs unlocking.
+        case lockedWaiting
     }
 
     let status: Status
@@ -29,6 +45,27 @@ struct TumpaSecurityContext: Codable {
     let fingerprint: String?
     let keyId: String?
     let errorMessage: String?
+    /// True iff we need a smartcard PIN (vs a software-key passphrase).
+    /// Only meaningful when status == .lockedWaiting.
+    let isPin: Bool
+
+    init(
+        status: Status,
+        signerEmail: String? = nil,
+        signerLabel: String? = nil,
+        fingerprint: String? = nil,
+        keyId: String? = nil,
+        errorMessage: String? = nil,
+        isPin: Bool = false
+    ) {
+        self.status = status
+        self.signerEmail = signerEmail
+        self.signerLabel = signerLabel
+        self.fingerprint = fingerprint
+        self.keyId = keyId
+        self.errorMessage = errorMessage
+        self.isPin = isPin
+    }
 
     static func encode(_ ctx: TumpaSecurityContext) -> Data {
         (try? JSONEncoder().encode(ctx)) ?? Data()
@@ -43,6 +80,11 @@ struct TumpaSecurityContext: Codable {
 /// SwiftUI view rendered inside the `MEExtensionViewController`.
 struct SecurityDetailView: View {
     let context: TumpaSecurityContext
+
+    @State private var passphrase: String = ""
+    @State private var unlocking: Bool = false
+    @State private var unlockError: String?
+    @State private var unlockSucceeded: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -59,7 +101,7 @@ struct SecurityDetailView: View {
             Divider()
 
             if let label = context.signerLabel, !label.isEmpty {
-                row("Signed by", label)
+                row(context.status == .lockedWaiting ? "Key" : "Signed by", label)
             }
             if let email = context.signerEmail, !email.isEmpty,
                email != context.signerLabel {
@@ -70,6 +112,11 @@ struct SecurityDetailView: View {
             } else if let kid = context.keyId, !kid.isEmpty {
                 row("Key ID", kid)
             }
+
+            if context.status == .lockedWaiting {
+                unlockForm()
+            }
+
             if let msg = context.errorMessage, !msg.isEmpty {
                 Text(msg)
                     .font(.caption)
@@ -77,7 +124,114 @@ struct SecurityDetailView: View {
             }
         }
         .padding()
-        .frame(minWidth: 320)
+        .frame(minWidth: 360)
+    }
+
+    @ViewBuilder
+    private func unlockForm() -> some View {
+        Divider()
+        if unlockSucceeded {
+            HStack(spacing: 8) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Unlocked").font(.subheadline).bold()
+                    Text("Click the message again to decrypt it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                SecureField(
+                    context.isPin ? "Smartcard PIN" : "Passphrase",
+                    text: $passphrase
+                )
+                .textFieldStyle(.roundedBorder)
+                .disabled(unlocking)
+                .onSubmit { Task { await submit() } }
+
+                HStack {
+                    Spacer()
+                    Button {
+                        Task { await submit() }
+                    } label: {
+                        if unlocking {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Unlock")
+                        }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(passphrase.isEmpty || unlocking)
+                }
+
+                if let err = unlockError {
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func submit() async {
+        guard let fingerprint = context.fingerprint, !fingerprint.isEmpty else {
+            unlockError = "Missing key fingerprint — cannot verify."
+            return
+        }
+        unlocking = true
+        unlockError = nil
+        defer { unlocking = false }
+
+        // Step 1: queue the typed secret in the XPC service's
+        // in-memory transient slot. cachePassphrase NEVER writes to
+        // ~/.tumpa/agent.sock directly — that would let an unverified
+        // wrong PIN burn smartcard attempt counter slots on every
+        // subsequent indexer-driven decrypt call.
+        do {
+            try await XPCClient.shared.cachePassphrase(
+                fingerprint: fingerprint,
+                isPin: context.isPin,
+                secret: Data(passphrase.utf8)
+            )
+        } catch {
+            unlockError = error.localizedDescription
+            return
+        }
+
+        // Step 2: verify the queued secret with a real libtumpa op.
+        // We do a tiny detached sign over a sentinel payload — wrong
+        // passphrase / wrong PIN fails fast; right passphrase
+        // succeeds and `LibtumpaRunner.signDetached` promotes the
+        // transient slot to the agent via its promote-on-success
+        // hook. After this, every future decode/sign/encrypt call
+        // hits the agent cache without re-prompting.
+        //
+        // Cost calculus for cards: this consumes 1 attempt counter
+        // slot — exactly the same as letting `decryptVerify` use the
+        // transient secret directly would have. Net cost is
+        // identical; UX is much better because the user gets
+        // instant feedback instead of "click the message and pray".
+        do {
+            _ = try await XPCClient.shared.signDetached(
+                canonicalizedBody: Data("tumpa-mail-unlock-verify".utf8),
+                signerFingerprint: fingerprint,
+                digest: "SHA256"
+            )
+            unlockSucceeded = true
+            passphrase = "" // zeroize the View state
+        } catch {
+            // libtumpa rejected the secret. The runner has already
+            // wiped the transient slot, so there's nothing left to
+            // burn another attempt slot on. Tell the user.
+            unlockError = context.isPin
+                ? "Wrong PIN. Please try again."
+                : "Wrong passphrase. Please try again."
+            // Don't clear `passphrase` — let the user edit and retry.
+        }
     }
 
     private func row(_ label: String, _ value: String) -> some View {
@@ -99,6 +253,7 @@ struct SecurityDetailView: View {
         case .signedUnknown:               return "questionmark.circle.fill"
         case .signedBad:                   return "xmark.seal.fill"
         case .decryptFailed:               return "lock.slash.fill"
+        case .lockedWaiting:               return "lock.fill"
         }
     }
 
@@ -108,6 +263,7 @@ struct SecurityDetailView: View {
         case .encrypted:                   return .green
         case .signedUnknown:               return .orange
         case .signedBad, .decryptFailed:   return .red
+        case .lockedWaiting:               return .orange
         }
     }
 
@@ -119,6 +275,8 @@ struct SecurityDetailView: View {
         case .signedUnknown:       return "Signed by an unknown key"
         case .signedBad:           return "Invalid signature"
         case .decryptFailed:       return "Decryption failed"
+        case .lockedWaiting:
+            return context.isPin ? "Smartcard locked" : "Key locked"
         }
     }
 
@@ -136,6 +294,10 @@ struct SecurityDetailView: View {
             return "The signature does not match the message content."
         case .decryptFailed:
             return "You may not have the right private key."
+        case .lockedWaiting:
+            return context.isPin
+                ? "Enter the smartcard PIN to decrypt this and future messages."
+                : "Enter the key passphrase to decrypt this and future messages."
         }
     }
 }
@@ -162,8 +324,11 @@ final class TumpaSecurityDetailViewController: MEExtensionViewController {
         host.translatesAutoresizingMaskIntoConstraints = true
         host.autoresizingMask = [.width, .height]
         // A minimum frame helps when Mail presents us inside a popover
-        // before SwiftUI has measured intrinsic content size.
-        host.frame = NSRect(x: 0, y: 0, width: 360, height: 200)
+        // before SwiftUI has measured intrinsic content size. The
+        // unlock state needs more vertical room for the SecureField +
+        // button than the read-only states.
+        let height: CGFloat = context.status == .lockedWaiting ? 280 : 200
+        host.frame = NSRect(x: 0, y: 0, width: 380, height: height)
         view = host
     }
 }

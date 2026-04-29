@@ -510,6 +510,74 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 )
             )
         case .failure(let err):
+            // libtumpa needed a passphrase / PIN that wasn't in the
+            // agent cache. Render a `.lockedWaiting` context so Mail's
+            // puzzle-piece popover prompts the user; on submit, the
+            // popover writes the secret to the agent and the user
+            // re-selects the message to redecode.
+            if case let XPCClientError.needsUnlock(fp, uid, isPin) = err {
+                log.info("decodeEncrypted: needs unlock for \(fp, privacy: .public)")
+                let lockedCtx = TumpaSecurityContext(
+                    status: .lockedWaiting,
+                    signerEmail: extractEmail(fromUid: uid),
+                    signerLabel: uid,
+                    fingerprint: fp,
+                    keyId: nil,
+                    errorMessage: nil,
+                    isPin: isPin
+                )
+                let secCtx = TumpaSecurityContext.encode(lockedCtx)
+
+                // Mail only shows the security shield (which opens
+                // `extensionViewController(messageContext:)`) when
+                // `signers` is non-empty. Setting `encryptionError`
+                // routes Mail to its built-in "could not decrypt"
+                // banner with Details/Dismiss instead, with no path
+                // to our popover. Workaround: attach the locked
+                // context to a synthetic signer entry so the shield
+                // appears; clicking it opens our popover →
+                // SecureField → cachePassphrase XPC →
+                // `~/.tumpa/agent.sock` PUT_PASSPHRASE → user
+                // re-selects message → cache hit → real decrypt.
+                let lockedSigner = makeSigners(
+                    fingerprint: fp,
+                    uid: uid,
+                    keyId: nil,
+                    contextPayload: secCtx
+                )
+                let secInfo = MEMessageSecurityInformation(
+                    signers: lockedSigner,
+                    isEncrypted: true,
+                    signingError: nil,
+                    encryptionError: nil
+                )
+
+                // Synthetic placeholder body. Without this, returning
+                // `data: original` (the raw RFC 822 wrapper) would
+                // make Mail render the constituent OpenPGP/MIME parts
+                // (`application/pgp-encrypted`, `encrypted.asc`) as
+                // file attachments — confusing UX. Inline a small
+                // RFC 822 message that explains what to do.
+                let placeholder = lockedPlaceholderMessage(
+                    envelopeSource: original,
+                    isPin: isPin,
+                    uid: uid
+                )
+
+                return MEDecodedMessage(
+                    data: placeholder,
+                    securityInformation: secInfo,
+                    context: secCtx,
+                    banner: MEDecodedMessageBanner(
+                        title: isPin
+                            ? "Encrypted — unlock the smartcard to read"
+                            : "Encrypted — enter the key passphrase to read",
+                        primaryActionTitle: "Unlock",
+                        dismissable: false
+                    )
+                )
+            }
+
             let secCtx = TumpaSecurityContext.encode(.init(
                 status: .decryptFailed,
                 signerEmail: nil, signerLabel: nil,
@@ -533,6 +601,65 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 )
             )
         }
+    }
+
+    /// Extract the bare email from a UID like
+    /// `Alice <alice@example.com>`. Returns `nil` if there's no
+    /// `<email>` form. Used for popover row rendering.
+    private func extractEmail(fromUid uid: String) -> String? {
+        guard let lt = uid.firstIndex(of: "<"),
+              let gt = uid.lastIndex(of: ">"),
+              lt < gt
+        else { return nil }
+        let email = String(uid[uid.index(after: lt)..<gt])
+        return email.isEmpty ? nil : email
+    }
+
+    /// Build a placeholder RFC 822 message body to hand back when an
+    /// inbound encrypted message is awaiting unlock. Reuses the
+    /// envelope (From/To/Subject/Date) of the original encrypted
+    /// message so Mail's reader still threads the message correctly,
+    /// and replaces the body with a `text/plain` instructing the
+    /// user to click the security shield.
+    private func lockedPlaceholderMessage(
+        envelopeSource original: Data,
+        isPin: Bool,
+        uid: String
+    ) -> Data {
+        let body = isPin
+            ? """
+              This message is encrypted to your smartcard.
+
+              Click the security shield in the message header to
+              enter your card PIN. After unlocking once, the PIN is
+              cached in the tumpa agent and subsequent messages
+              decrypt automatically.
+
+              Key: \(uid)
+              """
+            : """
+              This message is encrypted to your OpenPGP key.
+
+              Click the security shield in the message header to
+              enter your key passphrase. After unlocking once, the
+              passphrase is cached in the tumpa agent and subsequent
+              messages decrypt automatically.
+
+              Key: \(uid)
+              """
+
+        let synthetic = "Content-Type: text/plain; charset=utf-8\r\n" +
+                        "Content-Transfer-Encoding: 8bit\r\n" +
+                        "\r\n" +
+                        body
+
+        if let assembled = try? PGPMimeBuilder.assembleInboundDecodedMessage(
+            envelopeSource: original,
+            decryptedInnerPart: Data(synthetic.utf8)
+        ) {
+            return assembled
+        }
+        return Data(synthetic.utf8)
     }
 
     private func decodeSigned(signedEntity: Data, signature: Data, original: Data) -> MEDecodedMessage? {
@@ -831,7 +958,10 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         forMessageContext context: Data,
         completionHandler: @escaping (MEExtensionViewController?) -> Void
     ) {
-        completionHandler(extensionViewController(messageContext: context))
+        log.info("primaryActionClicked fired bytes=\(context.count)")
+        let vc = extensionViewController(messageContext: context)
+        log.info("primaryActionClicked returning vc=\(vc != nil ? "<vc>" : "nil", privacy: .public)")
+        completionHandler(vc)
     }
 
     // MARK: - Pipeline
