@@ -64,6 +64,64 @@ test: generate
 clean:
     rm -rf "{{build_dir}}" "{{dmg_out_dir}}" "{{xcodeproj}}"
 
+# Set CFBundleShortVersionString in the three Info.plists (host app,
+# XPC service, .appex). Build number (CFBundleVersion) is left alone —
+# bump it separately if a notarization re-submission needs distinct
+# build metadata.
+#
+#   just set-version 0.0.2
+set-version VERSION:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! [[ "{{VERSION}}" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+        echo "error: version '{{VERSION}}' must look like 1.2 / 1.2.3 / 1.2.3.4"
+        exit 1
+    fi
+    PB=/usr/libexec/PlistBuddy
+    for PLIST in \
+        "{{project_dir}}/TumpaMail/Info.plist" \
+        "{{project_dir}}/TumpaCryptoXPC/Info.plist" \
+        "{{project_dir}}/TumpaMailExtension/Info.plist"
+    do
+        [ -f "$PLIST" ] || { echo "error: $PLIST not found"; exit 1; }
+        "$PB" -c "Set :CFBundleShortVersionString {{VERSION}}" "$PLIST"
+        echo "  $PLIST -> CFBundleShortVersionString = {{VERSION}}"
+    done
+    echo "done. Regenerate Xcode project with 'just generate' if needed."
+
+# Increment CFBundleVersion (build number) by 1 in the three
+# Info.plists, keeping them in sync. Use this between notarization
+# resubmissions so LaunchServices / Finder / crash logs can tell
+# builds apart even when CFBundleShortVersionString stays the same.
+#
+# Reads the current value from TumpaMail/Info.plist as the source of
+# truth and writes the +1 result to all three.
+#
+#   just bump-build
+bump-build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PB=/usr/libexec/PlistBuddy
+    HOST_PLIST="{{project_dir}}/TumpaMail/Info.plist"
+    CURRENT=$("$PB" -c "Print :CFBundleVersion" "$HOST_PLIST")
+    if ! [[ "$CURRENT" =~ ^[0-9]+$ ]]; then
+        echo "error: CFBundleVersion in $HOST_PLIST is '$CURRENT' (not a plain integer)."
+        echo "       bump-build only handles integer build numbers; edit by hand if you need"
+        echo "       a dotted form like 1.2.3."
+        exit 1
+    fi
+    NEXT=$((CURRENT + 1))
+    for PLIST in \
+        "$HOST_PLIST" \
+        "{{project_dir}}/TumpaCryptoXPC/Info.plist" \
+        "{{project_dir}}/TumpaMailExtension/Info.plist"
+    do
+        [ -f "$PLIST" ] || { echo "error: $PLIST not found"; exit 1; }
+        "$PB" -c "Set :CFBundleVersion $NEXT" "$PLIST"
+        echo "  $PLIST -> CFBundleVersion = $NEXT"
+    done
+    echo "done. Was $CURRENT, now $NEXT."
+
 # ============================================================
 # DMG packaging
 # ============================================================

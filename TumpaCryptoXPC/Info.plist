@@ -17,16 +17,11 @@
 	<key>CFBundlePackageType</key>
 	<string>XPC!</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.0.1</string>
+	<string>0.0.2</string>
 	<key>CFBundleVersion</key>
 	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
-	<!--
-	    XPC service shape. The bundle ID above is what
-	    NSXPCConnection(serviceName: "in.kushaldas.tumpamail.crypto")
-	    looks up.
-	-->
 	<key>XPCService</key>
 	<dict>
 		<key>ServiceType</key>
