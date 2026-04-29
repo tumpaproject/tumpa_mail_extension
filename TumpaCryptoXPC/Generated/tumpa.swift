@@ -1768,6 +1768,23 @@ public func decryptAndVerify(ciphertext: Data, provider: SecretProvider)throws  
 })
 }
 /**
+ * Render a `tcli describe`-shaped multi-line summary of one keystore
+ * key for the host UI's "Key details" sheet.
+ *
+ * Output is byte-for-byte identical to `tcli describe <fp>` (same
+ * renderer in `libtumpa::describe::format_key_info`), including the
+ * trailing `Cards:` block when the keystore has linked card rows for
+ * the fingerprint. Returns `InvalidRecipients` when the fingerprint
+ * resolves to no key — same shape compose-side recipient lookups use.
+ */
+public func describeKey(fingerprint: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeTumpaError_lift) {
+    uniffi_tumpa_uniffi_fn_func_describe_key(
+        FfiConverterString.lower(fingerprint),$0
+    )
+})
+}
+/**
  * Encrypt `plaintext` to `recipients`. If `signer_fingerprint` is
  * `Some`, also sign with that key (one-pass-signature inside the
  * ciphertext). Card-first dispatch on the signing leg is implemented
@@ -1864,6 +1881,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_tumpa_uniffi_checksum_func_decrypt_and_verify() != 50047) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tumpa_uniffi_checksum_func_describe_key() != 54129) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tumpa_uniffi_checksum_func_encrypt() != 15976) {

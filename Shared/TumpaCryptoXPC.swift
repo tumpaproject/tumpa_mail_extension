@@ -137,6 +137,17 @@ public protocol TumpaCryptoXPC {
                           _ error: NSError?) -> Void
     )
 
+    /// Render a multi-line `tcli describe`-shaped key summary for one
+    /// keystore key. Used by the host app's "Key details" sheet so the
+    /// UI text stays byte-for-byte identical to `tcli describe <fp>`.
+    /// Includes the trailing `Cards:` block when the keystore has
+    /// linked card rows for the fingerprint.
+    func describeKey(
+        fingerprint: String,
+        reply: @escaping (_ details: String?,
+                          _ error: NSError?) -> Void
+    )
+
     /// Resolve a list of email addresses to keystore fingerprints.
     /// The reply's `resolved` dictionary contains only the emails that
     /// matched a usable key (uppercase hex, 40-char primary fingerprint);

@@ -304,6 +304,17 @@ public final class LibtumpaRunner {
         }
     }
 
+    // MARK: - Describe key
+
+    public func describeKey(fingerprint: String) throws -> String {
+        do {
+            return try tumpa_uniffi_describeKey(fingerprint: fingerprint)
+        } catch {
+            log.error("describeKey failed: \(String(describing: error), privacy: .public)")
+            throw translate(error)
+        }
+    }
+
     // MARK: - Resolve recipients
 
     public func resolveRecipients(emails: [String]) throws -> [String: String] {
@@ -369,4 +380,8 @@ private func tumpa_uniffi_listKeys() throws -> [KeyInfo] {
 
 private func tumpa_uniffi_resolveRecipients(emails: [String]) throws -> [String: String] {
     try resolveRecipients(emails: emails)
+}
+
+private func tumpa_uniffi_describeKey(fingerprint: String) throws -> String {
+    try describeKey(fingerprint: fingerprint)
 }

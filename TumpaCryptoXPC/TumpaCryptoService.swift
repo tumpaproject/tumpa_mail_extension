@@ -191,6 +191,22 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
         }
     }
 
+    // MARK: - Describe key
+
+    func describeKey(
+        fingerprint: String,
+        reply: @escaping (String?, NSError?) -> Void
+    ) {
+        workQueue.async {
+            do {
+                let text = try self.runner.describeKey(fingerprint: fingerprint)
+                reply(text, nil)
+            } catch {
+                reply(nil, Self.nsError(error))
+            }
+        }
+    }
+
     // MARK: - Resolve recipients
 
     func resolveRecipients(

@@ -105,6 +105,24 @@ final class XPCClient: ObservableObject {
         }
     }
 
+    func describeKey(_ fingerprint: String) async throws -> String {
+        try await withCheckedThrowingContinuation { cont in
+            do {
+                try proxy().describeKey(fingerprint: fingerprint) { details, error in
+                    if let e = error {
+                        cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
+                    } else if let d = details {
+                        cont.resume(returning: d)
+                    } else {
+                        cont.resume(throwing: XPCClientError.remote("empty describe reply"))
+                    }
+                }
+            } catch {
+                cont.resume(throwing: error)
+            }
+        }
+    }
+
     func agentSocketExists() async throws -> Bool {
         try await withCheckedThrowingContinuation { cont in
             do {

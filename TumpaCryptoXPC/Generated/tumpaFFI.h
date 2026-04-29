@@ -304,6 +304,11 @@ RustBuffer uniffi_tumpa_uniffi_fn_method_secretprovider_pin_for_card(void*_Nonnu
 RustBuffer uniffi_tumpa_uniffi_fn_func_decrypt_and_verify(RustBuffer ciphertext, void*_Nonnull provider, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_DESCRIBE_KEY
+#define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_DESCRIBE_KEY
+RustBuffer uniffi_tumpa_uniffi_fn_func_describe_key(RustBuffer fingerprint, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_ENCRYPT
 #define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_ENCRYPT
 RustBuffer uniffi_tumpa_uniffi_fn_func_encrypt(RustBuffer plaintext, RustBuffer recipients, RustBuffer signer_fingerprint, int8_t armor, RustBuffer provider, RustCallStatus *_Nonnull out_status
@@ -613,6 +618,12 @@ void ffi_tumpa_uniffi_rust_future_complete_void(uint64_t handle, RustCallStatus 
 #ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_DECRYPT_AND_VERIFY
 #define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_DECRYPT_AND_VERIFY
 uint16_t uniffi_tumpa_uniffi_checksum_func_decrypt_and_verify(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_DESCRIBE_KEY
+#define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_DESCRIBE_KEY
+uint16_t uniffi_tumpa_uniffi_checksum_func_describe_key(void
     
 );
 #endif

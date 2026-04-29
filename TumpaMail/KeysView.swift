@@ -21,6 +21,10 @@ struct KeysView: View {
     @State private var keys: [TumpaKeyInfo] = []
     @State private var loadingError: String?
     @State private var loading = true
+    /// The key whose detail sheet is currently shown. SwiftUI's
+    /// `.sheet(item:)` modal is driven off this — set it to a key to
+    /// open, set it back to nil to close.
+    @State private var selectedKey: TumpaKeyInfo?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -47,6 +51,7 @@ struct KeysView: View {
                 List {
                     ForEach(keys) { key in
                         keyRow(key)
+                            .onTapGesture { selectedKey = key }
                     }
                 }
                 .listStyle(.inset(alternatesRowBackgrounds: true))
@@ -61,6 +66,9 @@ struct KeysView: View {
         }
         .navigationTitle("Keys")
         .task { await load() }
+        .sheet(item: $selectedKey) { key in
+            KeyDetailSheet(key: key) { selectedKey = nil }
+        }
     }
 
     /// One row in the Keys list. Informational only — outgoing mail
@@ -118,6 +126,77 @@ struct KeysView: View {
         } catch {
             keys = []
             loadingError = error.localizedDescription
+        }
+    }
+}
+
+/// Modal sheet showing `tcli describe <fp>`-shaped output for one key.
+/// The text is rendered by `libtumpa::describe::format_key_info` in
+/// the XPC service so it matches `tcli describe` byte-for-byte.
+private struct KeyDetailSheet: View {
+
+    let key: TumpaKeyInfo
+    let onClose: () -> Void
+
+    @State private var details: String?
+    @State private var loadError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(key.primaryUid).font(.headline)
+                    Text(key.fingerprint)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                Spacer()
+                Button("Close", action: onClose)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
+            Divider()
+
+            if let text = details {
+                ScrollView {
+                    Text(text)
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(20)
+                }
+            } else if let err = loadError {
+                VStack(spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 32))
+                        .foregroundStyle(.orange)
+                    Text("Could not load key details")
+                        .font(.headline)
+                    Text(err)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(40)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ProgressView("Loading details…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(minWidth: 560, minHeight: 380)
+        .task { await load() }
+    }
+
+    @MainActor
+    private func load() async {
+        do {
+            details = try await XPCClient.shared.describeKey(key.fingerprint)
+        } catch {
+            loadError = error.localizedDescription
         }
     }
 }

@@ -87,6 +87,32 @@ final class LibtumpaRunnerTests: XCTestCase {
         XCTAssertEqual(TumpaSignatureStatus.unknown, "unknown")
     }
 
+    /// describeKey on an unknown fingerprint surfaces a typed
+    /// LibtumpaError. Pins the FFI surface used by the host UI's
+    /// "Key details" sheet.
+    func testDescribeKeyUnknownFingerprintThrowsTypedError() throws {
+        let runner = LibtumpaRunner()
+        try withFreshKeystore {
+            XCTAssertThrowsError(
+                try runner.describeKey(
+                    fingerprint: "0000000000000000000000000000000000000000"
+                )
+            ) { error in
+                guard let lib = error as? LibtumpaError else {
+                    XCTFail("expected LibtumpaError, got \(type(of: error))")
+                    return
+                }
+                // libtumpa's KeyNotFound flows through the FFI as
+                // InvalidRecipients — the same shape the compose-side
+                // recipient lookup uses, so callers can pattern-match
+                // on a single variant for "we don't have that key".
+                if case .invalidRecipients = lib { /* ok */ } else {
+                    XCTFail("expected .invalidRecipients, got \(lib)")
+                }
+            }
+        }
+    }
+
     /// Verify-detached against bytes that aren't a valid OpenPGP
     /// signature surfaces a typed `LibtumpaError.crypto` — confirms
     /// the FFI -> Swift error translation. Exercising the error path
