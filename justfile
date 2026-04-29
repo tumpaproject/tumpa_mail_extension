@@ -147,11 +147,16 @@ bump-build:
 # Unsigned DMG built from the standard Release build. Good for local
 # smoke installs on this machine; Gatekeeper will reject it elsewhere
 # (use `just build-dmg-signed` for anything you hand to another user).
+#
+# Output filename embeds CFBundleShortVersionString so multiple
+# version checkpoints can coexist in dist/ without overwriting.
 build-dmg: build
     #!/usr/bin/env bash
     set -euo pipefail
     APP_SRC="{{build_dir}}/Build/Products/{{configuration}}/{{product_name}}.app"
     [ -d "$APP_SRC" ] || { echo "error: $APP_SRC not found — did 'just build' succeed?"; exit 1; }
+
+    VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "{{project_dir}}/TumpaMail/Info.plist")
 
     STAGE="{{build_dir}}/dmg-stage"
     rm -rf "$STAGE" && mkdir -p "$STAGE"
@@ -160,7 +165,7 @@ build-dmg: build
     ditto "$APP_SRC" "$STAGE/{{display_name}}.app"
 
     mkdir -p "{{dmg_out_dir}}"
-    DMG_PATH="{{dmg_out_dir}}/{{dmg_basename}}-unsigned.dmg"
+    DMG_PATH="{{dmg_out_dir}}/{{dmg_basename}}-${VERSION}-unsigned.dmg"
     rm -f "$DMG_PATH"
     "{{make_dmg}}" "$STAGE" "$DMG_PATH" "{{dmg_volume_name}}" "{{display_name}}.app"
 
@@ -245,6 +250,11 @@ build-dmg-signed: generate
     APP_OUT="$EXPORT_DIR/{{product_name}}.app"
     [ -d "$APP_OUT" ] || { echo "error: exportArchive did not produce $APP_OUT"; exit 1; }
 
+    # Read the version AFTER the export so the value reflects what was
+    # actually shipped in this archive, not what's currently in the
+    # source-tree Info.plist (in case set-version was run mid-build).
+    VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_OUT/Contents/Info.plist")
+
     echo "==> verifying signature..."
     codesign --verify --deep --strict --verbose=2 "$APP_OUT"
 
@@ -266,7 +276,7 @@ build-dmg-signed: generate
     ditto "$APP_OUT" "$STAGE/{{display_name}}.app"
 
     mkdir -p "{{dmg_out_dir}}"
-    DMG_PATH="{{dmg_out_dir}}/{{dmg_basename}}.dmg"
+    DMG_PATH="{{dmg_out_dir}}/{{dmg_basename}}-${VERSION}.dmg"
     rm -f "$DMG_PATH"
     "{{make_dmg}}" "$STAGE" "$DMG_PATH" "{{dmg_volume_name}}" "{{display_name}}.app"
 
