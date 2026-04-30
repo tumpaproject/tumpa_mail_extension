@@ -562,6 +562,69 @@ final class PGPMimeParserMarkerPrecheckTests: XCTestCase {
     }
 }
 
+/// Tests for the inbound detached-verify recovery variants. Pin the
+/// shapes we generate on `bad`/`unknown` so the OutgoingSecurityHandler
+/// tolerance shim has known recovery candidates for each known
+/// sender / MTA mangling pattern.
+final class PGPMimeBuilderTolerantVariantsTests: XCTestCase {
+
+    /// `\r\r\n` collapses to `\r\n`. Pins the helper used by the
+    /// Outlook/Exchange recovery path. Idempotent on already-clean
+    /// CRLF input.
+    func testCollapseDoubledCR_PassThroughCleanCRLF() {
+        let clean = Data("foo\r\nbar\r\n".utf8)
+        XCTAssertEqual(PGPMimeBuilder.collapseDoubledCR(clean), clean)
+    }
+
+    func testCollapseDoubledCR_CollapsesExchangeMangling() {
+        let mangled = Data("foo\r\r\nbar\r\r\n".utf8)
+        let clean = Data("foo\r\nbar\r\n".utf8)
+        XCTAssertEqual(PGPMimeBuilder.collapseDoubledCR(mangled), clean)
+    }
+
+    /// jocar_failed.eml regression. Inner-part bytes between the two
+    /// `--tumpa-signed-…` boundaries (after stripping the boundary's
+    /// own leading/trailing CRLF) had `\r\r\n` doubling AND +2 extra
+    /// trailing CRLFs vs the bytes the sender actually signed. After
+    /// collapsing + stripping 2 trailing CRLFs we land on the exact
+    /// 86-byte form gpg --verify accepts. Pinned here so the recovery
+    /// candidate list keeps producing it.
+    func testTolerantSignedVariants_RecoversJocarFailedShape() {
+        // The strict-canonical bytes Mail's decoder produces, after
+        // canonicalizeForSigning runs on the LF-stripped inner-part:
+        let strictStr = "Content-Type: text/plain; charset=us-ascii\r\r\n"
+            + "Content-Transfer-Encoding: 7bit\r\r\n"
+            + "\r\r\n"
+            + "Kakor\r\r\n"
+            + "\r\r\n"
+            + "\r\n"
+        let strict = Data(strictStr.utf8)
+        let target = Data(
+            ("Content-Type: text/plain; charset=us-ascii\r\n"
+             + "Content-Transfer-Encoding: 7bit\r\n\r\nKakor\r\n").utf8
+        )
+        let variants = PGPMimeBuilder.tolerantSignedVariants(of: strict)
+        XCTAssertTrue(
+            variants.contains(target),
+            "expected 86-byte signed-shape in recovery variants; got lengths: \(variants.map(\.count))"
+        )
+    }
+
+    /// On clean input we should still emit some variants for the
+    /// "+1 trailing CRLF appended too many" sender-side mistake — so
+    /// well-behaved-strict-failing senders (rare but we've seen them)
+    /// can still recover by trimming. Just assert we get at least one
+    /// variant that's strictly shorter than the input.
+    func testTolerantSignedVariants_AlsoTriesTrailingCRLFStrip() {
+        let input = Data("Hello\r\n\r\n".utf8)
+        let variants = PGPMimeBuilder.tolerantSignedVariants(of: input)
+        XCTAssertTrue(
+            variants.contains(where: { $0.count < input.count }),
+            "expected at least one strictly-shorter variant; got \(variants.map(\.count))"
+        )
+    }
+}
+
 /// Tests for `PGPMimeParser.classify` — covers the strict RFC 3156
 /// path AND the Outlook-fallback path that rescues encrypted mail
 /// from Exchange Online's broken `multipart/mixed` wrapping.

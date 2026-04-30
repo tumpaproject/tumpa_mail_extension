@@ -432,8 +432,8 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 log.info("decodeEncrypted: inner multipart/signed detected (signedPart=\(signedPart.count)B sig=\(signature.count)B); running detached verify")
                 let canonical = PGPMimeBuilder.canonicalizeForSigning(signedPart)
                 let verify = blockingXPC {
-                    try await self.xpc.verifyDetached(
-                        signedBytes: canonical,
+                    try await self.verifyDetachedTolerant(
+                        canonicalSigned: canonical,
                         signature: signature
                     )
                 }
@@ -675,8 +675,8 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         let canonicalSigned = PGPMimeBuilder.canonicalizeForSigning(signedEntity)
         log.info("decodeSigned: canonicalized \(signedEntity.count)B → \(canonicalSigned.count)B for verify")
         let result = blockingXPC {
-            try await self.xpc.verifyDetached(
-                signedBytes: canonicalSigned,
+            try await self.verifyDetachedTolerant(
+                canonicalSigned: canonicalSigned,
                 signature: signature
             )
         }
@@ -706,7 +706,15 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 encryptionError: nil
             )
             return MEDecodedMessage(
-                data: original,
+                // Mail's text/plain renderer leaves the reading pane
+                // empty when the body bytes contain `\r\r\n` (Outlook /
+                // Exchange MTA mangling). Collapse it for rendering.
+                // Idempotent on clean CRLF, so well-formed senders
+                // round-trip unchanged. Only the `data:` slot is
+                // touched — verification already completed against
+                // the canonicalized signed entity above, so the
+                // signature status carried in `secInfo` is unaffected.
+                data: PGPMimeBuilder.collapseDoubledCR(original),
                 securityInformation: secInfo,
                 context: secCtx,
                 banner: securityBanner(
@@ -729,7 +737,11 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 encryptionError: nil
             )
             return MEDecodedMessage(
-                data: original,
+                // Same `\r\r\n` collapse as the success path — even
+                // when verify ultimately failed, we want the message
+                // body to render so the user can read the text and
+                // see the failure banner instead of a blank pane.
+                data: PGPMimeBuilder.collapseDoubledCR(original),
                 securityInformation: secInfo,
                 context: secCtx,
                 banner: securityBanner(
@@ -825,6 +837,54 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
     /// addObject:nil`) if the array is empty when `signers` is not.
     /// The `context` slot is never nil for the same reason — Mail's
     /// notification observer force-unwraps it somewhere.
+    /// Verify a detached signature with progressive recovery for
+    /// known sender / MTA mangling. Always tries the strict-canonical
+    /// bytes first — well-behaved senders verify there. On a `bad` /
+    /// `unknown` outcome we fall back to the variants described in
+    /// `PGPMimeBuilder.tolerantSignedVariants` (Outlook `\r\r\n`
+    /// doubling + extra trailing CRLFs) and accept the first one
+    /// that returns `good`.
+    ///
+    /// Diagnosed concretely on `jocar_failed.eml` (2026-04-30): wire
+    /// bytes had +2 trailing CRLFs vs signed AND `\r\r\n` doubling
+    /// from Exchange. Strict verify failed; collapse + 2-CRLF strip
+    /// recovered. Without this shim, Tumpa Mail-to-Tumpa Mail signed
+    /// messages routed through Microsoft Exchange / Outlook would
+    /// always show "Bad signature" even when they're cryptographically
+    /// fine end-to-end.
+    private func verifyDetachedTolerant(
+        canonicalSigned: Data,
+        signature: Data
+    ) async throws -> (
+        status: String,
+        signerFingerprint: String?,
+        signerKeyId: String?,
+        signerUid: String?
+    ) {
+        let strict = try await self.xpc.verifyDetached(
+            signedBytes: canonicalSigned,
+            signature: signature
+        )
+        if strict.status == TumpaSignatureStatus.good {
+            return strict
+        }
+        let variants = PGPMimeBuilder.tolerantSignedVariants(of: canonicalSigned)
+        log.info("verifyDetachedTolerant: strict=\(strict.status, privacy: .public); trying \(variants.count) recovery variant(s)")
+        for (idx, variant) in variants.enumerated() {
+            let attempt = try await self.xpc.verifyDetached(
+                signedBytes: variant,
+                signature: signature
+            )
+            if attempt.status == TumpaSignatureStatus.good {
+                log.info("verifyDetachedTolerant: recovered on variant #\(idx) (\(canonicalSigned.count)B → \(variant.count)B)")
+                return attempt
+            }
+        }
+        // No variant recovered — return the strict result so the
+        // popover renders the original error, not a guess.
+        return strict
+    }
+
     private func makeSigners(
         fingerprint: String?,
         uid: String?,

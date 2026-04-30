@@ -274,6 +274,88 @@ enum PGPMimeBuilder {
         return out
     }
 
+    /// Recovery variants for inbound detached verify when the
+    /// straight-canonical bytes don't match the signature.
+    ///
+    /// In the wild we see two compounding mangling sources for
+    /// `multipart/signed` text parts that round-trip through
+    /// Microsoft Exchange / Outlook:
+    ///
+    /// 1. `\r\r\n` doubling — Exchange runs an LF→CRLF normalization
+    ///    pass on text parts; on already-CRLF bytes the naive
+    ///    `s.replace("\n","\r\n")` doubles the CR. Only the
+    ///    `text/plain` part is affected; the `application/pgp-signature`
+    ///    part skips text normalization (different Content-Type).
+    ///
+    /// 2. Extra trailing CRLFs — observed on a 2026-04-30 inbound
+    ///    `jocar_failed.eml`. Wire bytes between boundaries had two
+    ///    extra `\r\n` beyond what the sender signed. Likely Mail's
+    ///    `MCMessageGenerator` adding blank lines on outbound, or a
+    ///    relay padding the part. RFC 2046 §5.1.1 only reserves ONE
+    ///    preceding-boundary CRLF; the rest belong to the body and
+    ///    break the hash.
+    ///
+    /// We try the straight-canonical form first (correct senders
+    /// always succeed there). Only if it fails do we fall back to the
+    /// recovery variants in this list — they're not part of the spec,
+    /// they're a tolerance shim for known sender-side / MTA bugs.
+    /// Each variant is a self-contained alternative; callers verify
+    /// against each in order and accept the first `good` outcome.
+    static func tolerantSignedVariants(of canonicalSigned: Data) -> [Data] {
+        var variants: [Data] = []
+
+        // Outlook/Exchange `\r\r\n` doubling collapse.
+        let collapsed = collapseDoubledCR(canonicalSigned)
+        if collapsed != canonicalSigned {
+            variants.append(collapsed)
+        }
+
+        // Extra trailing CRLFs. Try peeling off 1, 2, 3 trailing CRLFs
+        // from BOTH the original-canonical and the collapsed form —
+        // both sources of mangling can stack with extra-blank-line
+        // padding.
+        for base in [canonicalSigned, collapsed] {
+            var current = base
+            for _ in 0..<3 {
+                if current.hasSuffix(crlf) {
+                    current = current.subdata(in: current.startIndex..<(current.endIndex - 2))
+                    if !variants.contains(current) && current != canonicalSigned {
+                        variants.append(current)
+                    }
+                } else {
+                    break
+                }
+            }
+        }
+        return variants
+    }
+
+    /// Collapse runs of `\r\r\n` to `\r\n`. Idempotent. Used by
+    /// `tolerantSignedVariants` and worth keeping as a separate
+    /// helper so the regression test can target it directly.
+    static func collapseDoubledCR(_ data: Data) -> Data {
+        var out = Data()
+        out.reserveCapacity(data.count)
+        var i = data.startIndex
+        while i < data.endIndex {
+            // Look for the literal `\r\r\n` (two CRs followed by LF)
+            // and emit just `\r\n`.
+            if data[i] == 0x0D,
+               data.index(after: i) < data.endIndex,
+               data[data.index(after: i)] == 0x0D,
+               data.index(i, offsetBy: 2) < data.endIndex,
+               data[data.index(i, offsetBy: 2)] == 0x0A {
+                out.append(0x0D)
+                out.append(0x0A)
+                i = data.index(i, offsetBy: 3)
+            } else {
+                out.append(data[i])
+                i = data.index(after: i)
+            }
+        }
+        return out
+    }
+
     /// Rewrite `data`'s line endings to `eol` (which must be `crlf` or
     /// `lf`). Treats CR / LF / CRLF interchangeably as a single line
     /// terminator and re-emits each one as `eol`. Used on the inbound
