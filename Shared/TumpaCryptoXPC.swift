@@ -33,12 +33,23 @@ public protocol TumpaCryptoXPC {
     /// `actualDigest` reflects what the signature packet really uses,
     /// which the caller writes into the `multipart/signed` `micalg`
     /// parameter.
+    ///
+    /// `needsUnlockFingerprint` / `needsUnlockUid` / `needsUnlockIsPin`
+    /// are populated when libtumpa needed a passphrase or smartcard
+    /// PIN that wasn't in the agent / transient cache. The host app's
+    /// Unlock pane (and the in-Mail unlock popover) drive a probe-then-
+    /// prompt UX off these slots: an empty-secret `signDetached` call
+    /// returns the trio so the UI knows whether to ask for a PIN or a
+    /// passphrase, and against which key.
     func signDetached(
         canonicalizedBody: Data,
         signerFingerprint: String,
         digest: String,
         reply: @escaping (_ armoredSignature: Data?,
                           _ actualDigest: String?,
+                          _ needsUnlockFingerprint: String?,
+                          _ needsUnlockUid: String?,
+                          _ needsUnlockIsPin: Bool,
                           _ error: NSError?) -> Void
     )
 

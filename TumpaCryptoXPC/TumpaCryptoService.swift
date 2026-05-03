@@ -64,7 +64,7 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
         canonicalizedBody: Data,
         signerFingerprint: String,
         digest: String,
-        reply: @escaping (Data?, String?, NSError?) -> Void
+        reply: @escaping (Data?, String?, String?, String?, Bool, NSError?) -> Void
     ) {
         workQueue.async {
             do {
@@ -73,9 +73,17 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
                     signerFingerprint: signerFingerprint,
                     digest: digest
                 )
-                reply(out.armoredSignature, out.hashAlgorithm, nil)
+                reply(out.armoredSignature, out.hashAlgorithm, nil, nil, false, nil)
+            } catch let LibtumpaError.secretUnavailable(fp, uid, isPin, _) {
+                svcLog.error("signDetached needs unlock for \(fp, privacy: .public) (isPin=\(isPin))")
+                reply(
+                    nil, nil,
+                    fp, uid, isPin,
+                    Self.nsError(LibtumpaError.secretUnavailable(
+                        fingerprint: fp, uid: uid, isPin: isPin, message: "needs unlock"))
+                )
             } catch {
-                reply(nil, nil, Self.nsError(error))
+                reply(nil, nil, nil, nil, false, Self.nsError(error))
             }
         }
     }

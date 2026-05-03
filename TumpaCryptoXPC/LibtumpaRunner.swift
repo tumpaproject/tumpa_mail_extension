@@ -293,7 +293,13 @@ public final class LibtumpaRunner {
                     fingerprint: k.fingerprint,
                     primaryUid: k.primaryUid,
                     isSecret: k.isSecret,
-                    hasCard: false, // libtumpa list-keys doesn't surface card status today
+                    // hasCard is true when the keystore has at least
+                    // one `card_keys` row linking this fingerprint to
+                    // a smartcard. The Unlock pane uses
+                    // `(isSecret || hasCard)` to surface card-only
+                    // keys whose secret material lives on the card
+                    // (so isSecret is false but unlock still applies).
+                    hasCard: k.hasCard,
                     isRevoked: k.isRevoked,
                     isExpired: k.isExpired
                 )

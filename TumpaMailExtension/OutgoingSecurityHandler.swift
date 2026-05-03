@@ -1370,6 +1370,8 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 signerFingerprint: signer,
                 digest: preferredDigest
             )
+        } catch let XPCClientError.needsUnlock(_, uid, isPin) {
+            throw TumpaSendError.signing(unlockHint(uid: uid, isPin: isPin))
         } catch {
             throw TumpaSendError.signing(error.localizedDescription)
         }
@@ -1387,8 +1389,25 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 signerFingerprint: signer,
                 armor: true
             )
+        } catch let XPCClientError.needsUnlock(_, uid, isPin) {
+            throw TumpaSendError.encryption(unlockHint(uid: uid, isPin: isPin))
         } catch {
             throw TumpaSendError.encryption(error.localizedDescription)
+        }
+    }
+
+    // MailKit's compose UI surfaces `signingError` / `encryptionError`
+    // as a plain alert with an OK button — there is no hook to launch
+    // a SwiftUI popover at send time the way the inbound decode path
+    // does. Since the user can't act on the alert directly, the
+    // message itself has to tell them what to do: open Tumpa Mail and
+    // unlock the key. Without this, the alert just says "Smartcard
+    // PIN required for …" and dead-ends.
+    private func unlockHint(uid: String, isPin: Bool) -> String {
+        if isPin {
+            return "Smartcard PIN required for \(uid). Open Tumpa Mail, unlock the key on the Unlock pane, then click Send again."
+        } else {
+            return "Key passphrase required for \(uid). Open Tumpa Mail, unlock the key on the Unlock pane, then click Send again."
         }
     }
 

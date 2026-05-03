@@ -25,7 +25,7 @@ struct TumpaMailApp: App {
 struct RootView: View {
 
     enum Tab: Hashable {
-        case welcome, status, keys, settings
+        case welcome, status, unlock, keys, settings
     }
 
     @State private var selection: Tab = .welcome
@@ -38,6 +38,9 @@ struct RootView: View {
                 }
                 NavigationLink(value: Tab.status) {
                     Label("Status", systemImage: "stethoscope")
+                }
+                NavigationLink(value: Tab.unlock) {
+                    Label("Unlock", systemImage: "lock.open")
                 }
                 NavigationLink(value: Tab.keys) {
                     Label("Keys", systemImage: "key")
@@ -52,6 +55,7 @@ struct RootView: View {
             switch selection {
             case .welcome:  WelcomeView()
             case .status:   StatusView()
+            case .unlock:   UnlockKeysView()
             case .keys:     KeysView()
             case .settings: SettingsView()
             }

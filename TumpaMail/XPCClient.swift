@@ -12,9 +12,18 @@ import Foundation
 /// Errors surfaced from XPC calls. The XPC service signals trouble via
 /// `NSError` reply; we wrap that in this enum so the UI can pattern-
 /// match without typing `NSError.code` raw.
+///
+/// `needsUnlock` is the structured form of the "smartcard PIN required
+/// for X" / "passphrase required for X" error libtumpa returns when
+/// neither the agent nor the transient store has a usable secret. The
+/// host's UnlockKeysView pattern-matches on this to drive its
+/// probe-then-prompt UX (vs. a generic `.remote(String)` it would
+/// otherwise have to scrape the localized string for).
 enum XPCClientError: Error, LocalizedError {
     case connectionInvalidated
     case remote(String)
+    case needsUnlock(fingerprint: String, uid: String, isPin: Bool)
+    case noResult
 
     var errorDescription: String? {
         switch self {
@@ -22,6 +31,12 @@ enum XPCClientError: Error, LocalizedError {
             return "Connection to the Tumpa Crypto XPC service was lost."
         case .remote(let msg):
             return msg
+        case .needsUnlock(_, let uid, let isPin):
+            return isPin
+                ? "Smartcard PIN required for \(uid)"
+                : "Passphrase required for \(uid)"
+        case .noResult:
+            return "XPC reply carried no result."
         }
     }
 }
@@ -128,6 +143,85 @@ final class XPCClient: ObservableObject {
             do {
                 try proxy().agentSocketExists { exists in
                     cont.resume(returning: exists)
+                }
+            } catch {
+                cont.resume(throwing: error)
+            }
+        }
+    }
+
+    // MARK: - Unlock flow
+
+    /// Detached signature over `canonicalizedBody`. The Unlock pane
+    /// uses this with a sentinel payload (`"tumpa-mail-unlock-verify"`)
+    /// to probe whether a key is currently usable: a successful
+    /// signature means the agent (or transient store, after the user
+    /// just typed a PIN/passphrase) has the secret; an
+    /// `XPCClientError.needsUnlock` means it's locked and identifies
+    /// whether to ask for a PIN vs a passphrase.
+    func signDetached(
+        canonicalizedBody: Data,
+        signerFingerprint: String,
+        digest: String
+    ) async throws -> (signature: Data, actualDigest: String) {
+        try await withCheckedThrowingContinuation { cont in
+            do {
+                try proxy().signDetached(
+                    canonicalizedBody: canonicalizedBody,
+                    signerFingerprint: signerFingerprint,
+                    digest: digest
+                ) { sig, actual, needsFp, needsUid, needsIsPin, error in
+                    if let needsFp = needsFp, let needsUid = needsUid {
+                        cont.resume(throwing: XPCClientError.needsUnlock(
+                            fingerprint: needsFp,
+                            uid: needsUid,
+                            isPin: needsIsPin
+                        ))
+                    } else if let e = error {
+                        cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
+                    } else if let sig = sig, let actual = actual {
+                        cont.resume(returning: (sig, actual))
+                    } else {
+                        cont.resume(throwing: XPCClientError.noResult)
+                    }
+                }
+            } catch {
+                cont.resume(throwing: error)
+            }
+        }
+    }
+
+    /// Queue a popover-typed secret in the XPC service's in-memory
+    /// transient slot. The next `signDetached` call consumes it via
+    /// libtumpa's SecretProvider; success promotes it to
+    /// `~/.tumpa/agent.sock`, failure wipes it.
+    ///
+    /// CRITICAL: this method MUST NOT be used to write the secret
+    /// straight to the agent without a verifying op in between — the
+    /// agent has no way to know whether a passphrase / PIN is right,
+    /// and a wrong cached PIN would burn smartcard attempt counters
+    /// across the next several Mail decode operations. The caller
+    /// (UnlockKeysView / SecurityDetailView) always pairs this with
+    /// `signDetached` to verify before promotion.
+    func cachePassphrase(
+        fingerprint: String,
+        isPin: Bool,
+        secret: Data
+    ) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            do {
+                try proxy().cachePassphrase(
+                    fingerprint: fingerprint,
+                    isPin: isPin,
+                    secret: secret
+                ) { success, error in
+                    if let e = error {
+                        cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
+                    } else if success {
+                        cont.resume(returning: ())
+                    } else {
+                        cont.resume(throwing: XPCClientError.remote("agent rejected the secret"))
+                    }
                 }
             } catch {
                 cont.resume(throwing: error)

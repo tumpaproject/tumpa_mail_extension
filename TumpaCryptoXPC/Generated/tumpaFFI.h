@@ -265,11 +265,19 @@ typedef void (*UniffiCallbackInterfaceSecretProviderMethod1)(uint64_t, RustBuffe
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_SECRET_PROVIDER_METHOD2
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_SECRET_PROVIDER_METHOD2
+typedef void (*UniffiCallbackInterfaceSecretProviderMethod2)(uint64_t, RustBuffer, int8_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_SECRET_PROVIDER
 #define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_SECRET_PROVIDER
 typedef struct UniffiVTableCallbackInterfaceSecretProvider {
     UniffiCallbackInterfaceSecretProviderMethod0 _Nonnull passphraseForKey;
     UniffiCallbackInterfaceSecretProviderMethod1 _Nonnull pinForCard;
+    UniffiCallbackInterfaceSecretProviderMethod2 _Nonnull cacheVerifiedSecret;
     UniffiCallbackInterfaceFree _Nonnull uniffiFree;
 } UniffiVTableCallbackInterfaceSecretProvider;
 
@@ -297,6 +305,11 @@ RustBuffer uniffi_tumpa_uniffi_fn_method_secretprovider_passphrase_for_key(void*
 #ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_METHOD_SECRETPROVIDER_PIN_FOR_CARD
 #define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_METHOD_SECRETPROVIDER_PIN_FOR_CARD
 RustBuffer uniffi_tumpa_uniffi_fn_method_secretprovider_pin_for_card(void*_Nonnull ptr, RustBuffer card_serial, RustBuffer key_fingerprint, RustBuffer uid, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_METHOD_SECRETPROVIDER_CACHE_VERIFIED_SECRET
+#define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_METHOD_SECRETPROVIDER_CACHE_VERIFIED_SECRET
+void uniffi_tumpa_uniffi_fn_method_secretprovider_cache_verified_secret(void*_Nonnull ptr, RustBuffer fingerprint, int8_t is_pin, RustBuffer secret, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_DECRYPT_AND_VERIFY
@@ -666,6 +679,12 @@ uint16_t uniffi_tumpa_uniffi_checksum_method_secretprovider_passphrase_for_key(v
 #ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_METHOD_SECRETPROVIDER_PIN_FOR_CARD
 #define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_METHOD_SECRETPROVIDER_PIN_FOR_CARD
 uint16_t uniffi_tumpa_uniffi_checksum_method_secretprovider_pin_for_card(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_METHOD_SECRETPROVIDER_CACHE_VERIFIED_SECRET
+#define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_METHOD_SECRETPROVIDER_CACHE_VERIFIED_SECRET
+uint16_t uniffi_tumpa_uniffi_checksum_method_secretprovider_cache_verified_secret(void
     
 );
 #endif

@@ -136,4 +136,58 @@ final class LibtumpaRunnerTests: XCTestCase {
             }
         }
     }
+
+    /// signDetached against a fingerprint that isn't in the keystore
+    /// surfaces a typed `LibtumpaError`. The host app's UnlockKeysView
+    /// probe path drives off this — when the keystore changes
+    /// underneath us between listKeys and probe, we must get a typed
+    /// error (not a string) so the row can render the right state.
+    func testSignDetachedUnknownFingerprintThrowsTypedError() throws {
+        let runner = LibtumpaRunner()
+        try withFreshKeystore {
+            XCTAssertThrowsError(
+                try runner.signDetached(
+                    body: Data("tumpa-mail-unlock-verify".utf8),
+                    signerFingerprint: "0000000000000000000000000000000000000000",
+                    digest: "SHA256"
+                )
+            ) { error in
+                guard error is LibtumpaError else {
+                    XCTFail("expected LibtumpaError, got \(type(of: error))")
+                    return
+                }
+            }
+        }
+    }
+
+    /// `LibtumpaError.secretUnavailable.errorDescription` is the
+    /// string Mail surfaces when the .appex's outbound sign path
+    /// errors out without a cached PIN — that's the dialog screenshot
+    /// reported as "smartcard PIN required for Kushal Das …". The
+    /// host's UnlockKeysView avoids that surface by probing first,
+    /// but if the format string ever changes the existing screenshots
+    /// in CLAUDE.md / docs would silently rot. Pin the format here.
+    func testSecretUnavailableErrorDescriptionFormat() {
+        let pinErr = LibtumpaError.secretUnavailable(
+            fingerprint: "0123456789ABCDEF0123456789ABCDEF01234567",
+            uid: "Kushal Das <mail@kushaldas.in>",
+            isPin: true,
+            message: "needs unlock"
+        )
+        XCTAssertEqual(
+            pinErr.errorDescription,
+            "smartcard PIN required for Kushal Das <mail@kushaldas.in>"
+        )
+
+        let passErr = LibtumpaError.secretUnavailable(
+            fingerprint: "0123456789ABCDEF0123456789ABCDEF01234567",
+            uid: "Alice <alice@example.com>",
+            isPin: false,
+            message: "needs unlock"
+        )
+        XCTAssertEqual(
+            passErr.errorDescription,
+            "passphrase required for Alice <alice@example.com>"
+        )
+    }
 }

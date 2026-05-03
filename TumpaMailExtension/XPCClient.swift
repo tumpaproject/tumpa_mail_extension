@@ -154,8 +154,14 @@ final class XPCClient {
                 canonicalizedBody: canonicalizedBody,
                 signerFingerprint: signerFingerprint,
                 digest: digest
-            ) { sig, actual, e in
-                if let e = e {
+            ) { sig, actual, needsFp, needsUid, needsIsPin, e in
+                if let needsFp = needsFp, let needsUid = needsUid {
+                    cont.resume(throwing: XPCClientError.needsUnlock(
+                        fingerprint: needsFp,
+                        uid: needsUid,
+                        isPin: needsIsPin
+                    ))
+                } else if let e = e {
                     cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
                 } else if let sig = sig, let actual = actual {
                     cont.resume(returning: (sig, actual))

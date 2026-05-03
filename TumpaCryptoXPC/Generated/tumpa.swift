@@ -493,18 +493,20 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
  * Foreign-implemented callback that supplies a software-key
  * passphrase or a smartcard PIN when libtumpa needs one.
  *
- * Resolution order on the Swift side (matches
- * `tumpa-cli/src/pinentry.rs` so the UX is identical to today's
- * tclig path):
+ * Resolution order on the Swift side:
  *
- * 1. `~/.tumpa/agent.sock` cache lookup keyed on the key fingerprint.
- * 2. `TUMPA_PASSPHRASE` env var (software keys) /
- * `TUMPA_ADMIN_PIN` (admin paths — not used by `pin_for_card`).
- * 3. `pinentry-mac` over Assuan: SETDESC / SETPROMPT / GETPIN / BYE.
- * 4. Fail with [`SecretProviderError::Cancelled`].
+ * 1. `~/.tumpa/agent.sock` `GET_OR_PROMPT` — cache lookup, falling
+ * back to the agent's pinentry on a desktop session, or
+ * `PINENTRY_UNAVAILABLE` on a headless one.
+ * 2. Local fallback paths the foreign side may implement
+ * (env vars, in-app SwiftUI popovers, terminal prompts).
  *
  * Returned bytes are wrapped in `Zeroizing` immediately on the Rust
- * side and passed to libtumpa as `&Passphrase` / `&Pin`.
+ * side and passed to libtumpa as `&Passphrase` / `&Pin`. After a
+ * successful verify-then-real-op in the Rust wrapper, the wrapper
+ * calls [`SecretProvider::cache_verified_secret`] so the foreign
+ * side can `PUT_PASSPHRASE` the now-known-correct secret to the
+ * agent (or no-op if it was already cached).
  */
 public protocol SecretProvider: AnyObject, Sendable {
     
@@ -524,23 +526,42 @@ public protocol SecretProvider: AnyObject, Sendable {
      */
     func pinForCard(cardSerial: String, keyFingerprint: String, uid: String) throws  -> Data
     
+    /**
+     * Notify the foreign provider that `secret` was verified correct
+     * for the key identified by `fingerprint` (PIN if `is_pin` is
+     * true, software-key passphrase otherwise).
+     *
+     * The wrapper calls this immediately after a successful verify
+     * step (smartcard `VERIFY` APDU or sequoia secret-key unlock)
+     * and BEFORE the real crypto op. The provider should `PUT` the
+     * secret into the tumpa agent cache so subsequent calls for the
+     * same key skip the prompt.
+     *
+     * Returns nothing — cache write failures should not abort the
+     * in-flight crypto op. The provider is free to no-op (e.g. when
+     * the secret already came from the agent cache).
+     */
+    func cacheVerifiedSecret(fingerprint: String, isPin: Bool, secret: Data) 
+    
 }
 /**
  * Foreign-implemented callback that supplies a software-key
  * passphrase or a smartcard PIN when libtumpa needs one.
  *
- * Resolution order on the Swift side (matches
- * `tumpa-cli/src/pinentry.rs` so the UX is identical to today's
- * tclig path):
+ * Resolution order on the Swift side:
  *
- * 1. `~/.tumpa/agent.sock` cache lookup keyed on the key fingerprint.
- * 2. `TUMPA_PASSPHRASE` env var (software keys) /
- * `TUMPA_ADMIN_PIN` (admin paths — not used by `pin_for_card`).
- * 3. `pinentry-mac` over Assuan: SETDESC / SETPROMPT / GETPIN / BYE.
- * 4. Fail with [`SecretProviderError::Cancelled`].
+ * 1. `~/.tumpa/agent.sock` `GET_OR_PROMPT` — cache lookup, falling
+ * back to the agent's pinentry on a desktop session, or
+ * `PINENTRY_UNAVAILABLE` on a headless one.
+ * 2. Local fallback paths the foreign side may implement
+ * (env vars, in-app SwiftUI popovers, terminal prompts).
  *
  * Returned bytes are wrapped in `Zeroizing` immediately on the Rust
- * side and passed to libtumpa as `&Passphrase` / `&Pin`.
+ * side and passed to libtumpa as `&Passphrase` / `&Pin`. After a
+ * successful verify-then-real-op in the Rust wrapper, the wrapper
+ * calls [`SecretProvider::cache_verified_secret`] so the foreign
+ * side can `PUT_PASSPHRASE` the now-known-correct secret to the
+ * agent (or no-op if it was already cached).
  */
 open class SecretProviderImpl: SecretProvider, @unchecked Sendable {
     fileprivate let pointer: UnsafeMutableRawPointer!
@@ -625,6 +646,30 @@ open func pinForCard(cardSerial: String, keyFingerprint: String, uid: String)thr
 })
 }
     
+    /**
+     * Notify the foreign provider that `secret` was verified correct
+     * for the key identified by `fingerprint` (PIN if `is_pin` is
+     * true, software-key passphrase otherwise).
+     *
+     * The wrapper calls this immediately after a successful verify
+     * step (smartcard `VERIFY` APDU or sequoia secret-key unlock)
+     * and BEFORE the real crypto op. The provider should `PUT` the
+     * secret into the tumpa agent cache so subsequent calls for the
+     * same key skip the prompt.
+     *
+     * Returns nothing — cache write failures should not abort the
+     * in-flight crypto op. The provider is free to no-op (e.g. when
+     * the secret already came from the agent cache).
+     */
+open func cacheVerifiedSecret(fingerprint: String, isPin: Bool, secret: Data)  {try! rustCall() {
+    uniffi_tumpa_uniffi_fn_method_secretprovider_cache_verified_secret(self.uniffiClonePointer(),
+        FfiConverterString.lower(fingerprint),
+        FfiConverterBool.lower(isPin),
+        FfiConverterData.lower(secret),$0
+    )
+}
+}
+    
 
 }
 
@@ -692,6 +737,34 @@ fileprivate struct UniffiCallbackInterfaceSecretProvider {
                 makeCall: makeCall,
                 writeReturn: writeReturn,
                 lowerError: FfiConverterTypeSecretProviderError_lower
+            )
+        },
+        cacheVerifiedSecret: { (
+            uniffiHandle: UInt64,
+            fingerprint: RustBuffer,
+            isPin: Int8,
+            secret: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeSecretProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.cacheVerifiedSecret(
+                     fingerprint: try FfiConverterString.lift(fingerprint),
+                     isPin: try FfiConverterBool.lift(isPin),
+                     secret: try FfiConverterData.lift(secret)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
             )
         },
         uniffiFree: { (uniffiHandle: UInt64) -> () in
@@ -971,6 +1044,16 @@ public struct KeyInfo {
      * Card-backed keys have the public cert only and report `false`.
      */
     public var isSecret: Bool
+    /**
+     * True iff the keystore has at least one `card_keys` row linking
+     * this fingerprint to a smartcard. The secret material itself is
+     * on the card, not in the keystore — `is_secret` is false for
+     * these keys but unlock / sign / decrypt flows still work via
+     * libtumpa's card-first dispatch. The host's Unlock pane keys
+     * off this slot to surface card-only keys (otherwise they'd be
+     * invisible to a "filter where isSecret == true" check).
+     */
+    public var hasCard: Bool
     public var isRevoked: Bool
     public var isExpired: Bool
 
@@ -988,10 +1071,20 @@ public struct KeyInfo {
         /**
          * True iff secret key material is present in the keystore.
          * Card-backed keys have the public cert only and report `false`.
-         */isSecret: Bool, isRevoked: Bool, isExpired: Bool) {
+         */isSecret: Bool, 
+        /**
+         * True iff the keystore has at least one `card_keys` row linking
+         * this fingerprint to a smartcard. The secret material itself is
+         * on the card, not in the keystore — `is_secret` is false for
+         * these keys but unlock / sign / decrypt flows still work via
+         * libtumpa's card-first dispatch. The host's Unlock pane keys
+         * off this slot to surface card-only keys (otherwise they'd be
+         * invisible to a "filter where isSecret == true" check).
+         */hasCard: Bool, isRevoked: Bool, isExpired: Bool) {
         self.fingerprint = fingerprint
         self.primaryUid = primaryUid
         self.isSecret = isSecret
+        self.hasCard = hasCard
         self.isRevoked = isRevoked
         self.isExpired = isExpired
     }
@@ -1013,6 +1106,9 @@ extension KeyInfo: Equatable, Hashable {
         if lhs.isSecret != rhs.isSecret {
             return false
         }
+        if lhs.hasCard != rhs.hasCard {
+            return false
+        }
         if lhs.isRevoked != rhs.isRevoked {
             return false
         }
@@ -1026,6 +1122,7 @@ extension KeyInfo: Equatable, Hashable {
         hasher.combine(fingerprint)
         hasher.combine(primaryUid)
         hasher.combine(isSecret)
+        hasher.combine(hasCard)
         hasher.combine(isRevoked)
         hasher.combine(isExpired)
     }
@@ -1043,6 +1140,7 @@ public struct FfiConverterTypeKeyInfo: FfiConverterRustBuffer {
                 fingerprint: FfiConverterString.read(from: &buf), 
                 primaryUid: FfiConverterString.read(from: &buf), 
                 isSecret: FfiConverterBool.read(from: &buf), 
+                hasCard: FfiConverterBool.read(from: &buf), 
                 isRevoked: FfiConverterBool.read(from: &buf), 
                 isExpired: FfiConverterBool.read(from: &buf)
         )
@@ -1052,6 +1150,7 @@ public struct FfiConverterTypeKeyInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.fingerprint, into: &buf)
         FfiConverterString.write(value.primaryUid, into: &buf)
         FfiConverterBool.write(value.isSecret, into: &buf)
+        FfiConverterBool.write(value.hasCard, into: &buf)
         FfiConverterBool.write(value.isRevoked, into: &buf)
         FfiConverterBool.write(value.isExpired, into: &buf)
     }
@@ -1805,6 +1904,12 @@ public func encrypt(plaintext: Data, recipients: [String], signerFingerprint: St
 /**
  * List every key in the user's tumpa keystore. Honors the
  * `TUMPA_KEYSTORE` env var via [`libtumpa::store::open_keystore`].
+ *
+ * Each `KeyInfo` carries `has_card` derived from the keystore's
+ * `card_keys` table — populated via a single
+ * [`libtumpa::card::link::card_idents_map`] query rather than a
+ * per-key probe, so the cost stays one round trip regardless of
+ * keystore size.
  */
 public func listKeys()throws  -> [KeyInfo]  {
     return try  FfiConverterSequenceTypeKeyInfo.lift(try rustCallWithError(FfiConverterTypeTumpaError_lift) {
@@ -1889,7 +1994,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_tumpa_uniffi_checksum_func_encrypt() != 15976) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tumpa_uniffi_checksum_func_list_keys() != 28907) {
+    if (uniffi_tumpa_uniffi_checksum_func_list_keys() != 5263) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tumpa_uniffi_checksum_func_resolve_recipients() != 4786) {
@@ -1905,6 +2010,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tumpa_uniffi_checksum_method_secretprovider_pin_for_card() != 11822) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tumpa_uniffi_checksum_method_secretprovider_cache_verified_secret() != 4183) {
         return InitializationResult.apiChecksumMismatch
     }
 
