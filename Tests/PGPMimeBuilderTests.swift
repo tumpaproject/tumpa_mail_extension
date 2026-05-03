@@ -49,12 +49,12 @@ final class PGPMimeBuilderLineEndingTests: XCTestCase {
 
             Hello world.
             """.utf8)
-        let canonInner = Data("Content-Type: text/plain; charset=us-ascii\r\n\r\nHello world.\r\n".utf8)
+        let inner = Data("Content-Type: text/plain; charset=us-ascii\n\nHello world.\n".utf8)
         let signature = Data("-----BEGIN PGP SIGNATURE-----\n\nAAAA\n=AA\n-----END PGP SIGNATURE-----\n".utf8)
 
         let encoded = try PGPMimeBuilder.buildSignedMessage(
             original: original,
-            canonicalizedInnerPart: canonInner,
+            innerPart: inner,
             armoredSignature: signature,
             micalg: "pgp-sha256"
         )
@@ -87,12 +87,12 @@ final class PGPMimeBuilderLineEndingTests: XCTestCase {
     /// still produce CRLF outer envelope, so that path keeps working.
     func testBuildSignedMessage_CRLFOriginal_OuterEnvelopeIsCRLF() throws {
         let original = Data("From: a@example.com\r\nSubject: Hi\r\nTo: b@example.com\r\nContent-Type: text/plain\r\n\r\nbody\r\n".utf8)
-        let canonInner = Data("Content-Type: text/plain\r\n\r\nbody\r\n".utf8)
+        let inner = Data("Content-Type: text/plain\r\n\r\nbody\r\n".utf8)
         let signature = Data("-----BEGIN PGP SIGNATURE-----\n\nAAAA\n=AA\n-----END PGP SIGNATURE-----\n".utf8)
 
         let encoded = try PGPMimeBuilder.buildSignedMessage(
             original: original,
-            canonicalizedInnerPart: canonInner,
+            innerPart: inner,
             armoredSignature: signature,
             micalg: "pgp-sha256"
         )
@@ -104,39 +104,69 @@ final class PGPMimeBuilderLineEndingTests: XCTestCase {
                         "CRLF input must produce CRLF separator + CRLF before opening boundary")
     }
 
-    /// Regression: the bytes a recipient extracts between the two
-    /// inner-part boundaries MUST be byte-equal to the
-    /// `canonicalizedInnerPart` we passed to the signing call.
-    /// Earlier code relied on the inner part's own trailing CRLF as
-    /// the boundary's preceding CRLF — which made recipients strip
-    /// two bytes off the hashed entity, causing `tclig --verify` to
-    /// report BADSIG even though every other byte was correct
-    /// (observed on the 4.eml dump, 2026-04-27).
+    /// Regression: after Apple Mail's outbound submission applies its
+    /// uniform `\n -> \r\n` substitution to the bytes we return from
+    /// `MEEncodedOutgoingMessage.data`, the bytes a recipient extracts
+    /// between the two inner-part boundaries MUST be byte-equal to the
+    /// canonical CRLF form we passed to the signing call.
+    ///
+    /// Pre-2026-05-03 we embedded the CRLF-canonical inner part
+    /// directly inside an LF outer envelope. On non-Microsoft SMTP
+    /// submission paths that worked, but on Apple Mail's Microsoft 365
+    /// submission path the `\n -> \r\n` step doubled every embedded
+    /// `\r\n` to `\r\r\n` — recipients (Mail.app, Thunderbird) saw
+    /// empty bodies. Fix: hand Mail back an LF-form inner part; let
+    /// Mail's submission lift it to canonical CRLF on the wire.
     func testSignedInnerPart_RoundTripBytesEqualSignedBytes() throws {
-        let original = Data("From: a@example.com\nSubject: Hi\nTo: b@example.com\nContent-Type: text/plain\n\nbody\n".utf8)
-        // Mimic what OutgoingSecurityHandler.applyOpenPGP passes to
-        // tclig --detach-sign: a CRLF-canonical inner part terminated
-        // with CRLF.
-        let canonInner = Data("Content-Type: text/plain\r\nContent-Transfer-Encoding: 7bit\r\n\r\nHello,\r\n\r\nKushal\r\n".utf8)
+        let original = Data("From: a@example.com\nSubject: Hi\nTo: b@example.com\nContent-Type: text/plain\n\nHello,\n\nKushal\n".utf8)
+        let inner = try PGPMimeBuilder.extractInnerPart(from: original)
+        // What we actually signed: canonical CRLF form of the same bytes.
+        let canon = PGPMimeBuilder.canonicalizeForSigning(inner)
         let signature = Data("-----BEGIN PGP SIGNATURE-----\nAAAA\n-----END PGP SIGNATURE-----\n".utf8)
 
         let encoded = try PGPMimeBuilder.buildSignedMessage(
             original: original,
-            canonicalizedInnerPart: canonInner,
+            innerPart: inner,
             armoredSignature: signature,
             micalg: "pgp-sha256"
         )
 
-        // Re-parse the encoded multipart and pull the signed part out
-        // exactly the way a receiving MUA (or our own PGPMimeParser)
-        // would. The bytes MUST match what we asked tclig to sign.
-        switch PGPMimeParser.classify(encoded.bytes) {
+        // The bytes we hand Mail must be free of bare CR / `\r\n`
+        // anywhere — Mail's `\n -> \r\n` would double those.
+        XCTAssertEqual(encoded.bytes.firstIndex(of: 0x0D), nil,
+                       "returned bytes must contain no CR; Mail's submission would double them")
+
+        // Simulate Mail's outbound submission: every LF becomes CRLF.
+        let onTheWire = simulateMailSubmissionConversion(encoded.bytes)
+
+        // Now classify the wire bytes the way a recipient would and
+        // confirm the extracted signed entity matches the canonical
+        // bytes we computed the signature over.
+        switch PGPMimeParser.classify(onTheWire) {
         case .pgpSigned(let signedPart, _, _):
-            XCTAssertEqual(signedPart, canonInner,
-                           "extracted signed bytes must equal canonicalizedInnerPart")
+            XCTAssertEqual(signedPart, canon,
+                           "extracted signed bytes (post-submission) must equal canonical signed bytes")
         default:
             XCTFail("buildSignedMessage output should classify as pgpSigned")
         }
+    }
+
+    /// Apple Mail's outbound submission applies a uniform `\n -> \r\n`
+    /// substitution (verified empirically: an LF-only top-level
+    /// `text/plain` body lands at the recipient as canonical CRLF).
+    /// Used here to reason about wire bytes without setting up a real
+    /// SMTP / EWS / Graph round-trip. Naive on purpose — that's exactly
+    /// what Mail does; if it were smart enough to skip already-CRLF
+    /// runs, our pre-2026-05-03 encoder wouldn't have produced
+    /// `\r\r\n` doubling on the Microsoft 365 path.
+    private func simulateMailSubmissionConversion(_ data: Data) -> Data {
+        var out = Data()
+        out.reserveCapacity(data.count + data.count / 32)
+        for byte in data {
+            if byte == 0x0A { out.append(0x0D) }
+            out.append(byte)
+        }
+        return out
     }
 
     /// `multipart/encrypted` follows the same line-ending rule.

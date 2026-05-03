@@ -93,14 +93,19 @@ enum PGPMimeBuilder {
     /// caller gets it from `LibtumpaRunner.signDetached` (via the
     /// XPC `signDetached(canonicalizedBody:...)` reply slot).
     ///
-    /// The signed part the caller already detached-signed is the
-    /// CRLF-canonicalized headers+body of the inner MIME. Pass that
-    /// SAME byte sequence as `canonicalizedInnerPart` so the
-    /// resulting multipart structure carries exactly the bytes the
-    /// signature was made over.
+    /// `innerPart` MUST be in `original`'s line-ending style. For an
+    /// LF-only Apple Mail compose (the common case) it is LF; for a
+    /// CRLF input (sendmail-bypass test fixtures) it is CRLF. The
+    /// canonical CRLF form used for the signature compute is a
+    /// SEPARATE byte sequence — see `canonicalizeForSigning(_:)`.
+    /// Mail's outbound submission step applies a uniform `\n -> \r\n`
+    /// replace on the bytes we return; an LF inner part comes out as
+    /// canonical CRLF on the wire, while a CRLF inner part would be
+    /// doubled to `\r\r\n` (observed 2026-05-03 on the Microsoft 365
+    /// submission path, see project CLAUDE.md footgun).
     static func buildSignedMessage(
         original: Data,
-        canonicalizedInnerPart: Data,
+        innerPart: Data,
         armoredSignature: Data,
         micalg: String
     ) throws -> EncodedRFC822 {
@@ -126,28 +131,27 @@ enum PGPMimeBuilder {
         )
         out.append(eol)
 
-        // Inner part: the CRLF-canonical bytes the signature was made
-        // over, verbatim. RFC 3156 §5.1: "the signed message and
-        // transmitted message MUST be byte-for-byte identical to the
-        // form which was given to the signing process." The inner
-        // bytes stay CRLF even when the outer envelope is LF — Mail's
-        // MIME parser treats inter-boundary content as opaque, and
-        // CRLF on the wire is what the recipient verifies against.
+        // Inner part bytes, in the outer envelope's eol style. After
+        // Apple Mail's submission step applies its uniform `\n -> \r\n`
+        // replace, these come out as canonical CRLF on the wire — which
+        // is exactly the byte sequence the signature was made over (see
+        // `canonicalizeForSigning(_:)`). RFC 3156 §5.1 requires the
+        // signed bytes and the transmitted bytes match; the conversion
+        // happens in Mail's submission, not in our encoder.
         //
-        // We ALWAYS append CRLF after the inner part, even when it
-        // already ends with one. RFC 2046 §5.1.1: the CRLF
-        // immediately preceding `--boundary` is part of the boundary
-        // delimiter, not the part body. If we relied on the inner
-        // part's own trailing CRLF to serve as the boundary delimiter,
-        // recipients would strip 2 bytes off the part body before
-        // hashing — and tclig signed the longer (un-stripped) form,
-        // so verify fails. Always emitting an extra CRLF guarantees
-        // the bytes between the boundaries (= what recipients hash)
-        // match the bytes we passed to `tclig --detach-sign`.
+        // We ALWAYS append `eol` after the inner part, even when it
+        // already ends with one. RFC 2046 §5.1.1: the CRLF immediately
+        // preceding `--boundary` is part of the boundary delimiter,
+        // not the part body. Without a guaranteed trailing eol after
+        // the inner part, recipients would strip the body's own
+        // trailing line-break for the boundary delimiter and hash N-2
+        // bytes — verify fails because the signer hashed N. Emitting
+        // the extra eol guarantees the bytes between boundaries (post
+        // Mail's submission conversion) equal what we signed.
         out.append("--\(boundary)".data(using: .ascii)!)
         out.append(eol)
-        out.append(canonicalizedInnerPart)
-        out.append(crlf)
+        out.append(innerPart)
+        out.append(eol)
 
         // Signature part.
         out.append("--\(boundary)".data(using: .ascii)!)
@@ -398,9 +402,10 @@ enum PGPMimeBuilder {
     /// before signing.
     static func extractInnerPart(from rfc822: Data) throws -> Data {
         let split = try splitHeadersAndBody(rfc822)
+        let eol = detectLineEnding(in: rfc822)
         var out = Data()
         for header in split.headers where isInnerHeader(name: header.name) {
-            appendHeader(into: &out, name: header.name, value: header.value)
+            appendHeader(into: &out, name: header.name, value: header.value, eol: eol)
         }
         // If the original carried no Content-Type, default to text/plain
         // so unwrapping clients don't choke. RFC 822 + RFC 2045 say
@@ -411,11 +416,12 @@ enum PGPMimeBuilder {
             appendHeader(
                 into: &out,
                 name: "Content-Type",
-                value: "text/plain; charset=utf-8"
+                value: "text/plain; charset=utf-8",
+                eol: eol
             )
         }
-        out.append(crlf)
-        out.append(split.body)
+        out.append(eol)
+        out.append(rewriteLineEndings(split.body, to: eol))
         return out
     }
 

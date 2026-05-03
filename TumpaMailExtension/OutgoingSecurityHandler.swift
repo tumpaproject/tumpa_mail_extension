@@ -1159,9 +1159,15 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             signer: signer
         )
         let micalg = "pgp-\(result.actualDigest.lowercased())"
+        // Pass the EOL-matching `inner` (LF for Mail-composed bodies),
+        // NOT the CRLF-canonical `canon`. Mail's outbound submission
+        // applies a uniform `\n -> \r\n` replace which would otherwise
+        // turn embedded `\r\n` into `\r\r\n` and break recipient MIME
+        // parsers. Mail's conversion brings the LF inner up to canonical
+        // CRLF on the wire, matching what `canon` was signed against.
         let encoded = try PGPMimeBuilder.buildSignedMessage(
             original: rawMessage,
-            canonicalizedInnerPart: canon,
+            innerPart: inner,
             armoredSignature: result.signature,
             micalg: micalg
         )
