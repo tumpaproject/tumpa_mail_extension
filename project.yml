@@ -216,6 +216,15 @@ targets:
       - path: TumpaCryptoXPC/LibtumpaRunner.swift
       - path: TumpaCryptoXPC/SecretProvider.swift
       - path: TumpaCryptoXPC/Generated
+      # Pulled in for SecurityDetailViewControllerTests, which guards the
+      # Tahoe ViewBridge crash (child NSHostingController + constraints
+      # + preferredContentSize). XPCClient.swift is a transitive dep —
+      # SecurityDetailView's unlock submit closure references it but the
+      # tests don't exercise that path.
+      - path: TumpaMailExtension/SecurityDetailView.swift
+      - path: TumpaMailExtension/XPCClient.swift
+    frameworks:
+      - MailKit.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: in.kushaldas.tumpamail.tests

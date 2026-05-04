@@ -15,22 +15,7 @@ struct WelcomeView: View {
                 stepBlock(
                     n: 1,
                     title: "Install tumpa-cli",
-                    body: "If you haven't already:\n\n  brew tap tumpaproject/tumpa-cli\n  brew install tumpa-cli\n\nTumpa Mail needs tumpa-cli ≥ 0.5.0."
-                )
-                stepBlock(
-                    n: 2,
-                    title: "Start the agent",
-                    body: "  brew services start tumpa-cli\n\nThe agent caches passphrases / PINs across sign and decrypt operations so you aren't prompted on every email."
-                )
-                stepBlock(
-                    n: 3,
-                    title: "Enable the extension in Mail",
-                    body: "Open Mail → Settings → Extensions, then turn on \"Tumpa Mail\" under both Compose and Reading."
-                )
-                stepBlock(
-                    n: 4,
-                    title: "Send a signed test email",
-                    body: "Compose a new mail, click the lock icon and pick \"Sign\". Tumpa Mail produces a PGP/MIME multipart/signed message your recipient can verify in any standard PGP-aware client."
+                    body: "  brew tap tumpaproject/tumpa-cli\n  brew install tumpa-cli\n\nFor agent setup, key import, smartcard provisioning, and everything else, see the tumpa-cli README."
                 )
 
                 Spacer(minLength: 8)

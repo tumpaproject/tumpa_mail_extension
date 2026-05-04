@@ -83,9 +83,10 @@ clean:
     rm -rf "{{build_dir}}" "{{dmg_out_dir}}" "{{xcodeproj}}"
 
 # Set CFBundleShortVersionString in the three Info.plists (host app,
-# XPC service, .appex). Build number (CFBundleVersion) is left alone —
-# bump it separately if a notarization re-submission needs distinct
-# build metadata.
+# XPC service, .appex), and reset CFBundleVersion (build number) to 1.
+# A new release version starts a fresh build-number sequence; use
+# `just bump-build` between notarization re-submissions of the same
+# version.
 #
 #   just set-version 0.0.2
 set-version VERSION:
@@ -103,7 +104,8 @@ set-version VERSION:
     do
         [ -f "$PLIST" ] || { echo "error: $PLIST not found"; exit 1; }
         "$PB" -c "Set :CFBundleShortVersionString {{VERSION}}" "$PLIST"
-        echo "  $PLIST -> CFBundleShortVersionString = {{VERSION}}"
+        "$PB" -c "Set :CFBundleVersion 1" "$PLIST"
+        echo "  $PLIST -> CFBundleShortVersionString = {{VERSION}}, CFBundleVersion = 1"
     done
     echo "done. Regenerate Xcode project with 'just generate' if needed."
 

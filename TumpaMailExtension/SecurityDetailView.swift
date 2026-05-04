@@ -319,16 +319,30 @@ final class TumpaSecurityDetailViewController: MEExtensionViewController {
         fatalError("init(coder:) is not used")
     }
 
-    override func loadView() {
-        let host = NSHostingView(rootView: SecurityDetailView(context: context))
-        host.translatesAutoresizingMaskIntoConstraints = true
-        host.autoresizingMask = [.width, .height]
-        // A minimum frame helps when Mail presents us inside a popover
-        // before SwiftUI has measured intrinsic content size. The
-        // unlock state needs more vertical room for the SecureField +
-        // button than the read-only states.
-        let height: CGFloat = context.status == .lockedWaiting ? 280 : 200
-        host.frame = NSRect(x: 0, y: 0, width: 380, height: height)
-        view = host
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        // Use NSHostingController as a child VC (not a bare NSHostingView
+        // assigned to `view`). On Tahoe (macOS 26) Mail's ViewBridge
+        // serialization of the MEExtensionViewController across XPC
+        // crashes Mail's main thread in _swift_stdlib_bridgeErrorToNSError
+        // when the VC's view isn't a proper child controller with
+        // preferredContentSize set. Mirrors mailgpg/MailGPGExtension/
+        // SecurityDetailViewController.swift, which is known-working on
+        // Tahoe.
+        let host = NSHostingController(rootView: SecurityDetailView(context: context))
+        host.sizingOptions = .preferredContentSize
+        addChild(host)
+
+        host.view.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(host.view)
+        NSLayoutConstraint.activate([
+            host.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            host.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            host.view.topAnchor.constraint(equalTo: view.topAnchor),
+            host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+
+        preferredContentSize = host.view.fittingSize
     }
 }

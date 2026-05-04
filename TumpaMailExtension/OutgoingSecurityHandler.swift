@@ -503,11 +503,7 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 data: assembled,
                 securityInformation: secInfo,
                 context: secCtx,
-                banner: securityBanner(
-                    isEncrypted: true,
-                    signatureStatus: signatureStatus,
-                    errorMessage: nil
-                )
+                banner: nil
             )
         case .failure(let err):
             // libtumpa needed a passphrase / PIN that wasn't in the
@@ -568,13 +564,12 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                     data: placeholder,
                     securityInformation: secInfo,
                     context: secCtx,
-                    banner: MEDecodedMessageBanner(
-                        title: isPin
-                            ? "Encrypted — unlock the smartcard to read"
-                            : "Encrypted — enter the key passphrase to read",
-                        primaryActionTitle: "Unlock",
-                        dismissable: false
-                    )
+                    // banner intentionally nil on Tahoe 26.4.x — Mail
+                    // substitutes "Details" as a default primaryActionTitle
+                    // and clicking it crashes Mail (see the
+                    // `primaryActionClicked` doc-comment). The unlock
+                    // instruction lives in the placeholder message body.
+                    banner: nil
                 )
             }
 
@@ -594,11 +589,7 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 data: original,
                 securityInformation: secInfo,
                 context: secCtx,
-                banner: securityBanner(
-                    isEncrypted: true,
-                    signatureStatus: TumpaSignatureStatus.unsigned,
-                    errorMessage: err.localizedDescription
-                )
+                banner: nil
             )
         }
     }
@@ -717,11 +708,7 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 data: PGPMimeBuilder.collapseDoubledCR(original),
                 securityInformation: secInfo,
                 context: secCtx,
-                banner: securityBanner(
-                    isEncrypted: false,
-                    signatureStatus: r.status,
-                    errorMessage: nil
-                )
+                banner: nil
             )
         case .failure(let err):
             let secCtx = TumpaSecurityContext.encode(.init(
@@ -744,11 +731,7 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 data: PGPMimeBuilder.collapseDoubledCR(original),
                 securityInformation: secInfo,
                 context: secCtx,
-                banner: securityBanner(
-                    isEncrypted: false,
-                    signatureStatus: TumpaSignatureStatus.bad,
-                    errorMessage: err.localizedDescription
-                )
+                banner: nil
             )
         }
     }
@@ -801,31 +784,6 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             errorMessage: errorMessage
         )
         return TumpaSecurityContext.encode(ctx)
-    }
-
-    private func securityBanner(
-        isEncrypted: Bool,
-        signatureStatus: String,
-        errorMessage: String?
-    ) -> MEDecodedMessageBanner {
-        let title: String
-        if errorMessage != nil {
-            title = isEncrypted ? "Tumpa Mail could not decrypt this message" : "Tumpa Mail could not verify this message"
-        } else if isEncrypted && signatureStatus == TumpaSignatureStatus.good {
-            title = "Tumpa Mail decrypted and verified this message"
-        } else if isEncrypted {
-            title = "Tumpa Mail decrypted this message"
-        } else if signatureStatus == TumpaSignatureStatus.good {
-            title = "Tumpa Mail verified this message"
-        } else {
-            title = "Tumpa Mail checked this message"
-        }
-
-        return MEDecodedMessageBanner(
-            title: title,
-            primaryActionTitle: "Details",
-            dismissable: true
-        )
     }
 
     /// Build an `MEMessageSigner` array from XPC-returned fingerprint /
@@ -1018,10 +976,27 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         forMessageContext context: Data,
         completionHandler: @escaping (MEExtensionViewController?) -> Void
     ) {
-        log.info("primaryActionClicked fired bytes=\(context.count)")
-        let vc = extensionViewController(messageContext: context)
-        log.info("primaryActionClicked returning vc=\(vc != nil ? "<vc>" : "nil", privacy: .public)")
-        completionHandler(vc)
+        // Tahoe 26.4.x: invoking `completionHandler` AT ALL — with nil
+        // OR a non-nil VC — crashes Mail in
+        // `_swift_stdlib_bridgeErrorToNSError` while ViewBridge replays
+        // our XPC reply on the main thread. The faulting code path is
+        // independent of our argument; just sending the reply trips a
+        // Mail-internal Swift Error bridge on a nil existential.
+        //
+        // The only way to avoid the crash is to never call back. Mail
+        // shows a brief in-flight state and moves on — strictly
+        // worse-UX than calling back with a VC, but it doesn't crash
+        // the host process. Users open the popover via the security
+        // shield icon (synchronous `extensionViewController(signers:)`
+        // path; unaffected by this bug). The "Details" / "Unlock"
+        // banner button is effectively a decoy on Tahoe.
+        //
+        // Tested 2026-05-04 against Mail 16.0/3864.500.181 on macOS
+        // 26.4.1 (25E253): clicking the banner button does nothing
+        // visible and Mail stays alive.
+        log.info("primaryActionClicked fired bytes=\(context.count) — DROPPING reply (Tahoe ViewBridge crash workaround)")
+        _ = context
+        _ = completionHandler
     }
 
     // MARK: - Pipeline
@@ -1233,11 +1208,7 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             data: data,
             securityInformation: secInfo,
             context: secCtx,
-            banner: securityBanner(
-                isEncrypted: isEncrypted,
-                signatureStatus: status,
-                errorMessage: nil
-            )
+            banner: nil
         )
     }
 
