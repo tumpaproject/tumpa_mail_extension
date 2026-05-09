@@ -25,6 +25,22 @@ struct KeysView: View {
     /// `.sheet(item:)` modal is driven off this — set it to a key to
     /// open, set it back to nil to close.
     @State private var selectedKey: TumpaKeyInfo?
+    /// Filter text. Empty = show all. Matches case-insensitively
+    /// against `primaryUid` (covers name + email) and `fingerprint`
+    /// (so power users can paste a hex prefix and find a key fast).
+    @State private var searchText: String = ""
+
+    /// Keys filtered by `searchText`. Returns the full list when the
+    /// query is empty; otherwise keeps every key whose UID or
+    /// fingerprint contains the query (case-insensitive).
+    private var filteredKeys: [TumpaKeyInfo] {
+        let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return keys }
+        return keys.filter { key in
+            key.primaryUid.range(of: q, options: .caseInsensitive) != nil ||
+            key.fingerprint.range(of: q, options: .caseInsensitive) != nil
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -44,17 +60,27 @@ struct KeysView: View {
                     detail: "Import a key with `tcli import`, or generate one with the tumpa app, then refresh."
                 )
             } else {
-                // SwiftUI's `Table` on macOS treats cell clicks as row
-                // selection and routinely swallows embedded Button
-                // events. A plain List of custom HStack rows behaves
-                // exactly the way users expect.
-                List {
-                    ForEach(keys) { key in
-                        keyRow(key)
-                            .onTapGesture { selectedKey = key }
+                searchField
+                Divider()
+                if filteredKeys.isEmpty {
+                    emptyState(
+                        icon: "magnifyingglass",
+                        title: "No matches",
+                        detail: "No keys match \"\(searchText)\". Try a different name, email, or fingerprint prefix."
+                    )
+                } else {
+                    // SwiftUI's `Table` on macOS treats cell clicks as row
+                    // selection and routinely swallows embedded Button
+                    // events. A plain List of custom HStack rows behaves
+                    // exactly the way users expect.
+                    List {
+                        ForEach(filteredKeys) { key in
+                            keyRow(key)
+                                .onTapGesture { selectedKey = key }
+                        }
                     }
+                    .listStyle(.inset(alternatesRowBackgrounds: true))
                 }
-                .listStyle(.inset(alternatesRowBackgrounds: true))
             }
 
             Divider()
@@ -69,6 +95,29 @@ struct KeysView: View {
         .sheet(item: $selectedKey) { key in
             KeyDetailSheet(key: key) { selectedKey = nil }
         }
+    }
+
+    /// Top-of-view search box. Magnifying-glass icon, clear-button
+    /// when non-empty.
+    private var searchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search by name, email, or fingerprint", text: $searchText)
+                .textFieldStyle(.plain)
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear search")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
     }
 
     /// One row in the Keys list. Informational only — outgoing mail
