@@ -12,8 +12,7 @@ itself is just the bridge that lets Apple Mail use them.
 ## Requirements
 
 - macOS Sequoia 15.x or Tahoe 26.x
-- [tumpa-cli](https://github.com/tumpaproject/tumpa-cli) installed via
-  Homebrew. The `tcli` agent (`brew services start tumpa-cli`) caches
+- [tumpa-cli](https://github.com/tumpaproject/tumpa-cli) [installed via Homebrew](https://github.com/tumpaproject/tumpa-cli?tab=readme-ov-file#quickstart). The `tcli` agent (`brew services start tumpa-cli`) caches
   unlocked passphrases and PINs so you don't re-type them per
   message.
 - A smartcard (YubiKey, Nitrokey) is supported but optional —
@@ -22,16 +21,14 @@ itself is just the bridge that lets Apple Mail use them.
 ## Install
 
 A signed and notarized DMG is the supported install path. Drop
-`Tumpa Mail.app` into `/Applications`, then in Apple Mail:
+`Tumpa Mail.app` into `/Applications` and start it,
+then in Apple Mail:
 
 1. Open Mail → **Settings** → **Extensions**.
 2. Enable **Tumpa Mail** under **Mail Extensions**.
 
 That's it. Apple Mail will load the extension on next message open
 and on every compose.
-
-If you want to build from source (developer flow), see
-[CLAUDE.md](./CLAUDE.md).
 
 ## Setting up your keys
 
