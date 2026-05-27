@@ -573,24 +573,19 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 )
             }
 
-            let secCtx = TumpaSecurityContext.encode(.init(
-                status: .decryptFailed,
-                signerEmail: nil, signerLabel: nil,
-                fingerprint: nil, keyId: nil,
-                errorMessage: err.localizedDescription
-            ))
-            let secInfo = MEMessageSecurityInformation(
-                signers: [],
-                isEncrypted: true,
-                signingError: nil,
-                encryptionError: makeError(err.localizedDescription)
-            )
-            return MEDecodedMessage(
-                data: original,
-                securityInformation: secInfo,
-                context: secCtx,
-                banner: nil
-            )
+            // Return nil instead of a constructed MEDecodedMessage on
+            // a hard decrypt failure. MailGPG documents
+            // (MessageSecurityHandler.swift:497-500) that handing Mail
+            // a decoded result with the original ciphertext when decrypt
+            // failed makes MFLibrary's indexer loop and trigger a KVO
+            // re-entrancy crash — observed concretely on Tahoe 26.4.1
+            // as a Swift assertion failure on the main thread during
+            // archive (junk-mail filter training reads the body, which
+            // calls decodedMessage on a message we can't decrypt).
+            // Returning nil lets Mail render the raw envelope without
+            // a security indicator; the user still sees the message.
+            log.info("decodeEncrypted: returning nil on hard failure (\(err.localizedDescription, privacy: .public))")
+            return nil
         }
     }
 
@@ -711,28 +706,20 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 banner: nil
             )
         case .failure(let err):
-            let secCtx = TumpaSecurityContext.encode(.init(
-                status: .signedBad,
-                signerEmail: nil, signerLabel: nil,
-                fingerprint: nil, keyId: nil,
-                errorMessage: err.localizedDescription
-            ))
-            let secInfo = MEMessageSecurityInformation(
-                signers: [],
-                isEncrypted: false,
-                signingError: makeError(err.localizedDescription),
-                encryptionError: nil
-            )
-            return MEDecodedMessage(
-                // Same `\r\r\n` collapse as the success path — even
-                // when verify ultimately failed, we want the message
-                // body to render so the user can read the text and
-                // see the failure banner instead of a blank pane.
-                data: PGPMimeBuilder.collapseDoubledCR(original),
-                securityInformation: secInfo,
-                context: secCtx,
-                banner: nil
-            )
+            // Hard failure: XPC error, missing key, malformed signature
+            // packet. Same reasoning as decodeEncrypted's failure
+            // branch — returning an MEDecodedMessage with the original
+            // bytes makes Mail's MFLibrary indexer hit a KVO assertion
+            // (Tahoe 26.4.x) / addObject:nil crash (Sequoia 15.x)
+            // during archive's junk-mail training. Return nil so Mail
+            // renders the raw multipart/signed envelope without a
+            // signed-status indicator. Note: a verified-but-BAD
+            // signature still goes through the .success branch above
+            // (with signingError populated, empty signers) — Mail
+            // tolerates that shape because it didn't come from a
+            // failed decode.
+            log.info("decodeSigned: returning nil on hard failure (\(err.localizedDescription, privacy: .public))")
+            return nil
         }
     }
 
@@ -847,17 +834,18 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         fingerprint: String?,
         uid: String?,
         keyId: String?,
-        contextPayload: Data = Data()
+        contextPayload: Data? = nil
     ) -> [MEMessageSigner] {
         guard let label = uid ?? fingerprint ?? keyId, !label.isEmpty else {
             return []
         }
-        // Try to extract an RFC 822-style address from the UID first
-        // ("Real Name <email@example.com>"). If that's not parseable,
-        // fall back to a synthesized address built from the fingerprint
-        // (or whatever label we have). The synthetic address is mostly
-        // for crash-safety; Mail's compose UI may also use it as the
-        // signer chip label.
+        // Extract an RFC 822-style address from the UID
+        // ("Real Name <email@example.com>"). Pass empty string when the
+        // UID has no parseable `<email>` — matches MailGPG, which ships
+        // empty-string MEEmailAddress entries on Tahoe without crashing.
+        // The prior synthetic "openpgp:<fingerprint>" placeholder broke
+        // a Swift KVO precondition in Mail 16.0/Tahoe 26.4.x during
+        // MFLibrary indexing on archive (parser expects @-shaped input).
         var emails: [MEEmailAddress] = []
         if let uid = uid,
            let lt = uid.firstIndex(of: "<"),
@@ -869,12 +857,7 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             }
         }
         if emails.isEmpty {
-            // Synthesize a placeholder so Mail never sees an empty
-            // emailAddresses array. The fingerprint (preferred) reads
-            // as "openpgp:37417ABF…" so the user can tell it's a key
-            // ID rather than a real address; falls back to the label.
-            let synthetic = fingerprint.map { "openpgp:\($0)" } ?? "openpgp:\(label)"
-            emails.append(MEEmailAddress(rawString: synthetic))
+            emails.append(MEEmailAddress(rawString: ""))
         }
         let signer = MEMessageSigner(
             emailAddresses: emails,
