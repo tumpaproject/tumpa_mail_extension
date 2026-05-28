@@ -72,13 +72,30 @@ enum PGPMimeBuilder {
     private static let lf: Data = "\n".data(using: .ascii)!
     private static let crlfcrlf: Data = "\r\n\r\n".data(using: .ascii)!
 
-    /// Detect the line-ending style used by an RFC 822 message. Looks
-    /// at the first 4 KiB of headers — long enough to span the routing
-    /// headers plus a fold or two without scanning a whole multi-MB
-    /// body. Returns `\r\n` only when explicit CRLF is present;
-    /// otherwise `\n` (Apple Mail's native form).
+    /// Detect the line-ending style used by an RFC 822 message.
+    ///
+    /// Probes ONLY the header block — up to the first blank-line
+    /// separator (or 4 KiB, whichever comes first). Apple Mail's own
+    /// headers are reliably LF, but a reply that quotes an
+    /// Outlook/Exchange thread carries CRLF *body* content; if the
+    /// probe reached into that body it would mis-detect CRLF and make
+    /// us emit a CRLF envelope, which Mail's outbound `\n -> \r\n`
+    /// submission then doubles to `\r\r\n` on the wire (empty / mangled
+    /// body at the recipient). A genuine CRLF message still detects
+    /// CRLF: its header block uses `\r\n` too. Mirrors the
+    /// earliest-separator logic in `splitHeadersAndBody`.
     static func detectLineEnding(in data: Data) -> Data {
-        let probe = data.prefix(4096)
+        let cap = data.index(data.startIndex, offsetBy: min(4096, data.count))
+        let crlfSep = data.range(of: crlfcrlf)
+        let lfSep = data.range(of: "\n\n".data(using: .ascii)!)
+        let sepUpper: Data.Index
+        switch (crlfSep, lfSep) {
+        case (let r?, let l?): sepUpper = r.lowerBound <= l.lowerBound ? r.upperBound : l.upperBound
+        case (let r?, nil):    sepUpper = r.upperBound
+        case (nil, let l?):    sepUpper = l.upperBound
+        case (nil, nil):       sepUpper = cap
+        }
+        let probe = data.subdata(in: data.startIndex..<min(sepUpper, cap))
         return probe.range(of: crlf) != nil ? crlf : lf
     }
 

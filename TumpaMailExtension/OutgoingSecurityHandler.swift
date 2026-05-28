@@ -1214,6 +1214,19 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 longKeyId: p.longKeyId
             )
         }
+        // The signed entity we hand Mail MUST be uniform in the
+        // original's line-ending style (LF for a Mail-composed draft).
+        // Mail's outbound submission applies a blanket `\n -> \r\n`; any
+        // stray `\r\n` still embedded here — the F1 `multipart/mixed`
+        // wrapper emits CRLF, and a reply quoting CRLF Outlook/Exchange
+        // content can carry it too — would become `\r\r\n` on the wire
+        // and collapse the recipient's MIME parse to a flat text/plain
+        // (boundaries + inner headers shown literally, quoted-printable
+        // left un-decoded). `canonicalizeForSigning` still lifts this to
+        // CRLF for the signature; Mail's submission lifts the LF inner to
+        // the same CRLF on the wire, so the recipient's hash matches.
+        let eol = PGPMimeBuilder.detectLineEnding(in: rawMessage)
+        inner = PGPMimeBuilder.rewriteLineEndings(inner, to: eol)
         let canon = PGPMimeBuilder.canonicalizeForSigning(inner)
         guard let signer = signer else {
             throw TumpaSendError.signing("no signing key available; pick a default signer in Tumpa Mail.")

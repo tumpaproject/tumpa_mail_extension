@@ -33,6 +33,22 @@ final class PGPMimeBuilderLineEndingTests: XCTestCase {
                        "Any CRLF in headers means detect CRLF")
     }
 
+    /// A reply that quotes a CRLF Outlook/Exchange thread carries CRLF
+    /// *body* content while Mail's own headers stay LF. detectLineEnding
+    /// must report LF — it probes the header block only. Reporting CRLF
+    /// here would make us emit a CRLF envelope that Mail's `\n -> \r\n`
+    /// outbound submission doubles to `\r\r\n`, mangling the body at the
+    /// recipient (regression: re_q_2 geteduroam thread, 2026-05-28).
+    func testDetectLineEnding_LFHeadersWithQuotedCRLFBody_DetectsLF() {
+        var msg = "From: a@example.com\nTo: b@example.com\nSubject: Re: x\n"
+        msg += "Content-Type: text/plain; charset=utf-8\n\n"
+        msg += "On 28 May 2026, X wrote:\r\n"
+        msg += String(repeating: "> quoted CRLF line from Outlook\r\n", count: 40)
+        let eol = PGPMimeBuilder.detectLineEnding(in: Data(msg.utf8))
+        XCTAssertEqual(eol, "\n".data(using: .ascii)!,
+                       "CRLF in quoted body must not flip detection; header block is LF")
+    }
+
     /// Construct a representative Apple Mail original (LF outer, single
     /// text/plain inner) and check that `buildSignedMessage` emits LF
     /// for outer headers and `--boundary` delimiters. This is the
@@ -148,6 +164,79 @@ final class PGPMimeBuilderLineEndingTests: XCTestCase {
                            "extracted signed bytes (post-submission) must equal canonical signed bytes")
         default:
             XCTFail("buildSignedMessage output should classify as pgpSigned")
+        }
+    }
+
+    /// The path that broke recipients on the geteduroam thread
+    /// (`re_q_2.eml`, 2026-05-28): a `multipart/alternative` Apple Mail
+    /// reply (text/plain + text/html, quoted-printable) signed with F1
+    /// "attach public key" ON (the default). F1 wraps the inner part in
+    /// a `multipart/mixed` sibling, and that wrapper emitted CRLF while
+    /// the rest of the entity was LF — Mail's `\n -> \r\n` submission
+    /// doubled the wrapper's `\r\n` to `\r\r\n`, collapsing the
+    /// recipient's MIME parse to a flat text/plain (boundaries + inner
+    /// headers shown literally, quoted-printable left un-decoded). The
+    /// fix normalizes the whole signed entity to the original's eol
+    /// before signing, so the bytes handed to Mail carry no CR.
+    func testSignedMultipartAlternativeWithPubkey_NoDoubledCRAfterSubmission() throws {
+        let bnd = "Apple-Mail=_D91D1D8D-5295-4E71-BEE0-1ED50113A44F"
+        let original = Data("""
+            From: Johan <jocar@example.se>
+            To: Mikael <mikott@example.se>
+            Subject: Re: Q
+            Content-Type: multipart/alternative; boundary="\(bnd)"
+            MIME-Version: 1.0
+
+            --\(bnd)
+            Content-Transfer-Encoding: quoted-printable
+            Content-Type: text/plain; charset=utf-8
+
+            Nej tyv=C3=A4rr inte.=20
+            --\(bnd)
+            Content-Transfer-Encoding: quoted-printable
+            Content-Type: text/html; charset=utf-8
+
+            <html><body>Nej tyv=C3=A4rr</body></html>
+            --\(bnd)--
+            """.utf8)
+
+        // Mirror applyOpenPGP's signed path: extract inner, F1-wrap,
+        // normalize to the original's eol, then sign + build.
+        var inner = try PGPMimeBuilder.extractInnerPart(from: original)
+        inner = PGPMimeBuilder.wrapWithPubkeyAttachment(
+            inner: inner,
+            armoredPubkey: "-----BEGIN PGP PUBLIC KEY BLOCK-----\nKEY\n-----END PGP PUBLIC KEY BLOCK-----\n",
+            longKeyId: "ABCDEF0123456789"
+        )
+        let eol = PGPMimeBuilder.detectLineEnding(in: original)
+        inner = PGPMimeBuilder.rewriteLineEndings(inner, to: eol)
+        let canon = PGPMimeBuilder.canonicalizeForSigning(inner)
+        let signature = Data("-----BEGIN PGP SIGNATURE-----\nAAAA\n-----END PGP SIGNATURE-----\n".utf8)
+
+        let encoded = try PGPMimeBuilder.buildSignedMessage(
+            original: original,
+            innerPart: inner,
+            armoredSignature: signature,
+            micalg: "pgp-sha256"
+        )
+
+        // Invariant: zero CR in the bytes handed to Mail.
+        XCTAssertEqual(encoded.bytes.firstIndex(of: 0x0D), nil,
+                       "F1-wrapped multipart/alternative signed entity must contain no CR before Mail's submission")
+
+        // After Mail's `\n -> \r\n`, there must be no `\r\r\n` anywhere.
+        let onTheWire = simulateMailSubmissionConversion(encoded.bytes)
+        XCTAssertNil(onTheWire.range(of: Data([0x0D, 0x0D])),
+                     "on-the-wire bytes must not contain doubled CR (\\r\\r\\n)")
+
+        // And a recipient's extracted signed entity must still equal the
+        // canonical bytes we signed.
+        switch PGPMimeParser.classify(onTheWire) {
+        case .pgpSigned(let signedPart, _, _):
+            XCTAssertEqual(signedPart, canon,
+                           "extracted signed bytes (post-submission) must equal canonical signed bytes")
+        default:
+            XCTFail("F1-wrapped multipart/alternative output should classify as pgpSigned")
         }
     }
 
