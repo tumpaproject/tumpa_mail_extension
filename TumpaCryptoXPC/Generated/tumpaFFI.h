@@ -312,6 +312,12 @@ RustBuffer uniffi_tumpa_uniffi_fn_method_secretprovider_pin_for_card(void*_Nonnu
 void uniffi_tumpa_uniffi_fn_method_secretprovider_cache_verified_secret(void*_Nonnull ptr, RustBuffer fingerprint, int8_t is_pin, RustBuffer secret, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_AMBIGUOUS_ADDRESSES
+#define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_AMBIGUOUS_ADDRESSES
+RustBuffer uniffi_tumpa_uniffi_fn_func_ambiguous_addresses(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_DECRYPT_AND_VERIFY
 #define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_DECRYPT_AND_VERIFY
 RustBuffer uniffi_tumpa_uniffi_fn_func_decrypt_and_verify(RustBuffer ciphertext, void*_Nonnull provider, RustCallStatus *_Nonnull out_status
@@ -324,7 +330,22 @@ RustBuffer uniffi_tumpa_uniffi_fn_func_describe_key(RustBuffer fingerprint, Rust
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_ENCRYPT
 #define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_ENCRYPT
-RustBuffer uniffi_tumpa_uniffi_fn_func_encrypt(RustBuffer plaintext, RustBuffer recipients, RustBuffer signer_fingerprint, int8_t armor, RustBuffer provider, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_tumpa_uniffi_fn_func_encrypt(RustBuffer plaintext, RustBuffer recipients, RustBuffer hidden_recipients, RustBuffer signer_fingerprint, int8_t armor, RustBuffer provider, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_EXPORT_AUTOCRYPT_KEYDATA
+#define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_EXPORT_AUTOCRYPT_KEYDATA
+RustBuffer uniffi_tumpa_uniffi_fn_func_export_autocrypt_keydata(RustBuffer fingerprint, RustBuffer addr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_EXPORT_PUBLIC_ARMORED
+#define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_EXPORT_PUBLIC_ARMORED
+RustBuffer uniffi_tumpa_uniffi_fn_func_export_public_armored(RustBuffer fingerprint, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_KEYS_FOR_EMAIL
+#define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_KEYS_FOR_EMAIL
+RustBuffer uniffi_tumpa_uniffi_fn_func_keys_for_email(RustBuffer email, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_FN_FUNC_LIST_KEYS
@@ -628,6 +649,12 @@ void ffi_tumpa_uniffi_rust_future_free_void(uint64_t handle
 void ffi_tumpa_uniffi_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_AMBIGUOUS_ADDRESSES
+#define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_AMBIGUOUS_ADDRESSES
+uint16_t uniffi_tumpa_uniffi_checksum_func_ambiguous_addresses(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_DECRYPT_AND_VERIFY
 #define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_DECRYPT_AND_VERIFY
 uint16_t uniffi_tumpa_uniffi_checksum_func_decrypt_and_verify(void
@@ -643,6 +670,24 @@ uint16_t uniffi_tumpa_uniffi_checksum_func_describe_key(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_ENCRYPT
 #define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_ENCRYPT
 uint16_t uniffi_tumpa_uniffi_checksum_func_encrypt(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_EXPORT_AUTOCRYPT_KEYDATA
+#define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_EXPORT_AUTOCRYPT_KEYDATA
+uint16_t uniffi_tumpa_uniffi_checksum_func_export_autocrypt_keydata(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_EXPORT_PUBLIC_ARMORED
+#define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_EXPORT_PUBLIC_ARMORED
+uint16_t uniffi_tumpa_uniffi_checksum_func_export_public_armored(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_KEYS_FOR_EMAIL
+#define UNIFFI_FFIDEF_UNIFFI_TUMPA_UNIFFI_CHECKSUM_FUNC_KEYS_FOR_EMAIL
+uint16_t uniffi_tumpa_uniffi_checksum_func_keys_for_email(void
     
 );
 #endif

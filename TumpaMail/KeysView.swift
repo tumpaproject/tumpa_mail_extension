@@ -5,7 +5,9 @@
 // management in `tcli` (import / export / generate); the host UI
 // just shows what's there. Signing-key selection is automatic —
 // outgoing messages are signed with the keystore key whose UID
-// matches the message's From address.
+// matches the message's From address. When an address has more than
+// one usable key, the user can pin which one to sign as / encrypt to
+// in the Key Selection pane (`KeySelectionView`).
 
 import SwiftUI
 

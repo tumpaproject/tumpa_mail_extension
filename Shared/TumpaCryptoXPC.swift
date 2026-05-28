@@ -55,8 +55,17 @@ public protocol TumpaCryptoXPC {
 
     // MARK: - Encryption (PGP/MIME multipart/encrypted)
 
-    /// Encrypt `plaintext` to `recipientFingerprints`, optionally signing
-    /// with `signerFingerprint` (the sign-then-encrypt path).
+    /// Encrypt `plaintext` to a split visible / hidden recipient set,
+    /// optionally signing with `signerFingerprint` (the sign-then-
+    /// encrypt path).
+    ///
+    /// `recipientFingerprints` are visible (To/Cc): their key id is
+    /// exposed in the PKESK header. `hiddenRecipientFingerprints` are
+    /// encoded with the RFC 4880 throw-keyid wildcard (all-zero
+    /// recipient key id) so a To/Cc recipient running
+    /// `gpg --list-packets` on the ciphertext cannot enumerate the
+    /// Bcc set. Callers without a Bcc list pass `[]` for the hidden
+    /// slot.
     ///
     /// When `signerFingerprint` is non-nil and the signer's key has a
     /// matching connected OpenPGP card, the inner signature is produced
@@ -73,6 +82,7 @@ public protocol TumpaCryptoXPC {
     func encrypt(
         plaintext: Data,
         recipientFingerprints: [String],
+        hiddenRecipientFingerprints: [String],
         signerFingerprint: String?,
         armor: Bool,
         reply: @escaping (_ armoredCiphertext: Data?,
@@ -159,6 +169,38 @@ public protocol TumpaCryptoXPC {
                           _ error: NSError?) -> Void
     )
 
+    /// Autocrypt-minimised public-key bytes for the `Autocrypt:`
+    /// header `keydata=` attribute. Returns binary OpenPGP per
+    /// <https://autocrypt.org/level1.html#openpgp-based-key-data> —
+    /// the caller base64-encodes (no line wrap) into the header
+    /// value. Output carries only the primary key, one UID matching
+    /// `addr`, and the subkey self-signatures; User Attribute packets
+    /// and third-party certifications are stripped.
+    ///
+    /// Best-effort surface: a missing key, mismatched addr, or any
+    /// libtumpa export error returns `nil` keydata + a non-nil error.
+    /// The caller logs and proceeds without an Autocrypt header
+    /// rather than failing the send.
+    func exportAutocryptKeydata(
+        fingerprint: String,
+        addr: String,
+        reply: @escaping (_ keydata: Data?, _ error: NSError?) -> Void
+    )
+
+    /// Full ASCII-armored transferable public key for the
+    /// `application/pgp-keys` attachment used by the "attach my
+    /// public key when signing" feature (F1). Filename convention is
+    /// `OpenPGP_0x<long-keyid>.asc` (Thunderbird).
+    ///
+    /// Unlike [`exportAutocryptKeydata`], the output is the full cert
+    /// — every UID, every subkey, every third-party certification.
+    /// Best-effort: failure returns `nil` armoredKey + a non-nil
+    /// error; the caller logs and proceeds without the attachment.
+    func exportPublicArmored(
+        fingerprint: String,
+        reply: @escaping (_ armoredKey: String?, _ error: NSError?) -> Void
+    )
+
     /// Resolve a list of email addresses to keystore fingerprints.
     /// The reply's `resolved` dictionary contains only the emails that
     /// matched a usable key (uppercase hex, 40-char primary fingerprint);
@@ -170,6 +212,29 @@ public protocol TumpaCryptoXPC {
     func resolveRecipients(
         emails: [String],
         reply: @escaping (_ resolved: [String: String],
+                          _ error: NSError?) -> Void
+    )
+
+    /// Every usable (non-revoked, non-expired) keystore cert whose any
+    /// UID carries `email`. Unlike `resolveRecipients`, this returns
+    /// ALL matches rather than the first — the host UI's per-address
+    /// key picker shows them as options and the .appex validates a
+    /// stored per-address override against this set. The Swift caller
+    /// filters to signable certs (`isSecret || hasCard`) for the
+    /// signing picker; the encryption picker uses the full set.
+    func keysForEmail(
+        email: String,
+        reply: @escaping (_ keys: [TumpaKeyInfo],
+                          _ error: NSError?) -> Void
+    )
+
+    /// Lowercased email addresses matched by MORE THAN ONE usable cert
+    /// — the addresses where signing / encryption is ambiguous and the
+    /// host UI offers a key picker. Addresses matched by zero or one
+    /// usable cert are omitted (nothing to choose). Drives
+    /// `KeySelectionView`.
+    func ambiguousAddresses(
+        reply: @escaping (_ addresses: [String],
                           _ error: NSError?) -> Void
     )
 
@@ -299,4 +364,108 @@ public enum TumpaMailDefaults {
     public static let defaultDigest = "defaultDigest"
     public static let alwaysSign = "alwaysSign"
     public static let preferEncryptedReplies = "preferEncryptedReplies"
+    /// F1 — attach the sender's full ASCII-armored public key as an
+    /// `application/pgp-keys` MIME part on outbound signed messages
+    /// (Thunderbird convention `OpenPGP_0x<long-keyid>.asc`). Sealed
+    /// inside the signature / ciphertext. Default-on.
+    public static let attachPubkeyOnSign = "attachPubkeyOnSign"
+    /// F2 — emit an Autocrypt header with `prefer-encrypt=mutual` and
+    /// folded base64 keydata on outbound signed and/or encrypted
+    /// messages. Default-on. See
+    /// <https://autocrypt.org/level1.html>.
+    public static let autocryptHeader = "autocryptHeader"
+    /// F3 — encrypt the subject (draft-ietf-lamps-header-protection
+    /// v1). The real `Subject` is moved inside the ciphertext via a
+    /// protected-headers wrapper; the cleartext outer envelope carries
+    /// `Subject: ...`. Recovered on decrypt. Default-on.
+    public static let encryptSubject = "encryptSubject"
+
+    /// Per-address signing-key override map: lowercased email →
+    /// 40-char fingerprint. Set in the host's Key Selection pane when
+    /// an address has more than one usable cert; read by the .appex's
+    /// `resolveSignerFingerprint`. Absent entry = "Automatic"
+    /// (first-match). Stored as a native `[String: String]` plist
+    /// dictionary in the App Group suite. See [`TumpaKeyOverrides`].
+    public static let signingKeyOverrides = "signingKeyOverrides"
+    /// Per-address encryption-key override map: lowercased email →
+    /// 40-char fingerprint. Same shape and semantics as
+    /// `signingKeyOverrides`, but consulted when choosing which cert
+    /// to encrypt TO for a recipient (and for the sender's own
+    /// self-recipient Sent copy).
+    public static let encryptionKeyOverrides = "encryptionKeyOverrides"
+}
+
+/// Read / write the per-address signing & encryption key overrides the
+/// host's Key Selection pane sets and the .appex honors at send time.
+/// Centralized here so both ends normalize identically — emails are
+/// matched case-insensitively, so every key is lowercased before it
+/// touches the dictionary. A `nil` fingerprint clears the entry
+/// (back to "Automatic" / first-match).
+public enum TumpaKeyOverrides {
+
+    public static func signingFingerprint(
+        forEmail email: String,
+        in defaults: UserDefaults?
+    ) -> String? {
+        fingerprint(forEmail: email, key: TumpaMailDefaults.signingKeyOverrides, in: defaults)
+    }
+
+    public static func encryptionFingerprint(
+        forEmail email: String,
+        in defaults: UserDefaults?
+    ) -> String? {
+        fingerprint(forEmail: email, key: TumpaMailDefaults.encryptionKeyOverrides, in: defaults)
+    }
+
+    public static func setSigning(
+        _ fingerprint: String?,
+        forEmail email: String,
+        in defaults: UserDefaults?
+    ) {
+        set(fingerprint, forEmail: email, key: TumpaMailDefaults.signingKeyOverrides, in: defaults)
+    }
+
+    public static func setEncryption(
+        _ fingerprint: String?,
+        forEmail email: String,
+        in defaults: UserDefaults?
+    ) {
+        set(fingerprint, forEmail: email, key: TumpaMailDefaults.encryptionKeyOverrides, in: defaults)
+    }
+
+    // MARK: - Shared internals
+
+    private static func normalize(_ email: String) -> String {
+        email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func fingerprint(
+        forEmail email: String,
+        key: String,
+        in defaults: UserDefaults?
+    ) -> String? {
+        guard let map = defaults?.dictionary(forKey: key) as? [String: String] else { return nil }
+        return map[normalize(email)]
+    }
+
+    private static func set(
+        _ fingerprint: String?,
+        forEmail email: String,
+        key: String,
+        in defaults: UserDefaults?
+    ) {
+        guard let defaults else { return }
+        var map = (defaults.dictionary(forKey: key) as? [String: String]) ?? [:]
+        let normalized = normalize(email)
+        if let fingerprint, !fingerprint.isEmpty {
+            map[normalized] = fingerprint
+        } else {
+            map.removeValue(forKey: normalized)
+        }
+        if map.isEmpty {
+            defaults.removeObject(forKey: key)
+        } else {
+            defaults.set(map, forKey: key)
+        }
+    }
 }

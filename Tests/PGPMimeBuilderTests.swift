@@ -790,3 +790,289 @@ final class PGPMimeParserClassifyTests: XCTestCase {
         }
     }
 }
+
+// MARK: - Tolerant variants property-pin (chithi 214daf0c port)
+
+/// Property-pin for `tolerantSignedVariants`. The recovery variant set
+/// must be reachable from the canonical input by a composition of the
+/// two documented transforms — `\r\r\n -> \r\n` collapse and
+/// trailing-CRLF strip (up to 3) — and NOTHING ELSE. Any drift
+/// (mid-stream LF stripping, body-content insertion, header rewriting)
+/// would silently let an attacker mutate signed content while still
+/// reporting Good. The legal set is small enough to enumerate from the
+/// canonical, so the assertion is total, not sampled.
+final class PGPMimeBuilderTolerantVariantsPropertyTests: XCTestCase {
+
+    func testTolerantSignedVariants_OnlyStripsTrailingCRLFOrCollapsesDoubledCR() {
+        // Two representative inputs: one already canonical (variants
+        // can only be the trailing-strip ladder) and one with
+        // doubled-CR in the middle (collapse triggers AND the strip
+        // ladder applies to both bases).
+        let canonicalPlain = Data("line1\r\nline2\r\nline3\r\n\r\n\r\n".utf8)
+        let canonicalDoubled = Data("head\r\r\nbody\r\nfoot\r\n\r\n".utf8)
+        let crlf = Data("\r\n".utf8)
+
+        for canonical in [canonicalPlain, canonicalDoubled] {
+            let variants = PGPMimeBuilder.tolerantSignedVariants(of: canonical)
+
+            // Build the legal-variant set from canonical alone.
+            let collapsed = PGPMimeBuilder.collapseDoubledCR(canonical)
+            var legal: [Data] = [canonical]
+            if collapsed != canonical { legal.append(collapsed) }
+            for base in [canonical, collapsed] {
+                var current = base
+                for _ in 0..<3 {
+                    if current.suffix(2) == crlf {
+                        current = current.subdata(in: 0..<(current.count - 2))
+                        if !legal.contains(current) { legal.append(current) }
+                    } else {
+                        break
+                    }
+                }
+            }
+
+            for v in variants {
+                XCTAssertTrue(
+                    legal.contains(v),
+                    "tolerant variant escaped the legal-transform set: \(String(data: v, encoding: .utf8) ?? "<bin>")\nlegal set sizes: \(legal.map { $0.count })"
+                )
+                // Variants must not include the canonical itself — the
+                // verifier already tried the canonical form first.
+                XCTAssertNotEqual(v, canonical, "canonical must not appear in the recovery variants list")
+            }
+        }
+    }
+}
+
+// MARK: - Autocrypt header (F2)
+
+final class PGPMimeBuilderAutocryptHeaderTests: XCTestCase {
+
+    /// The Autocrypt header must start with `addr=` and carry
+    /// `prefer-encrypt=mutual` and `keydata=`. Continuation lines fold
+    /// with CRLF + a single leading space (RFC 5322 FWS), no wire line
+    /// exceeds the 78-column soft limit, and the de-whitespaced
+    /// keydata value base64-decodes back to the original bytes
+    /// (Autocrypt Level 1 §2.1.1).
+    func testFormatAutocryptHeader_FoldsAndRoundTripsKeydata() {
+        // 600 bytes is enough to force several continuation lines.
+        var keydata = Data()
+        for i in 0..<600 { keydata.append(UInt8(i % 256)) }
+        let header = PGPMimeBuilder.formatAutocryptHeader(addr: "alice@example.com", keydata: keydata)
+
+        XCTAssertTrue(header.hasPrefix("Autocrypt: addr=alice@example.com; "))
+        XCTAssertTrue(header.contains("prefer-encrypt=mutual;"))
+        XCTAssertTrue(header.contains("keydata="))
+
+        for (idx, line) in header.split(separator: "\r\n", omittingEmptySubsequences: false).enumerated() {
+            if idx == 0 { continue }   // first line carries `Autocrypt:` + start of keydata
+            XCTAssertTrue(line.hasPrefix(" "), "continuation must start with one space: \(line)")
+            XCTAssertFalse(line.hasPrefix("  "), "continuation must start with exactly one space: \(line)")
+            XCTAssertLessThanOrEqual(line.count, 78, "line exceeds 78 cols: \(line.count)")
+        }
+
+        // Strip ALL whitespace from the keydata value and base64-decode.
+        let value = header.components(separatedBy: "keydata=").last ?? ""
+        let compact = value.replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+        let decoded = Data(base64Encoded: compact) ?? Data()
+        XCTAssertEqual(decoded, keydata, "keydata must round-trip exactly")
+    }
+
+    /// `addr` injection defense: a malformed account address must not
+    /// be allowed to splice extra header lines into the outbound
+    /// message via embedded CR/LF. The header is hand-built and
+    /// bypasses any RFC 2047 encoder, so the stripping happens here.
+    /// Security property: no CR/LF survives in the `addr=` segment.
+    /// The malicious text body ("Bcc:") DOES survive concatenated
+    /// into the addr value, but without CR/LF separation it can't
+    /// open a new header line — every RFC 5322 header parser splits
+    /// on CRLF, so the whole concatenated junk reads as one (malformed
+    /// but bounded) Autocrypt field.
+    func testFormatAutocryptHeader_StripsCRLFFromAddr() {
+        let header = PGPMimeBuilder.formatAutocryptHeader(
+            addr: "alice@example.com\r\nBcc: victim@example.invalid",
+            keydata: Data([0x00, 0x01, 0x02])
+        )
+        // Split on `; ` to isolate the addr= segment. The hand-built
+        // header DOES contain `\r\n ` for keydata folding, so the
+        // CR/LF assertion has to scope to the addr= segment only.
+        let parts = header.split(separator: ";")
+        let addrSegment = parts.first(where: { $0.contains("addr=") }) ?? ""
+        XCTAssertFalse(addrSegment.contains("\r"))
+        XCTAssertFalse(addrSegment.contains("\n"))
+    }
+}
+
+// MARK: - Protected headers v1 (F3 — encrypted subject)
+
+final class PGPMimeBuilderProtectedHeadersTests: XCTestCase {
+
+    /// The wrapper carries the real Subject in its own header block
+    /// and the original inner part as a single child.
+    func testWrapWithProtectedHeaders_CarriesSubjectAndChild() {
+        let inner = Data(
+            ("Content-Type: text/plain; charset=us-ascii\r\n"
+             + "\r\nhello world\r\n").utf8
+        )
+        let wrapped = PGPMimeBuilder.wrapWithProtectedHeaders(inner: inner, subject: "Secret Subject")
+        let s = String(data: wrapped, encoding: .utf8) ?? ""
+        XCTAssertTrue(s.contains("protected-headers=\"v1\""))
+        XCTAssertTrue(s.contains("Subject: Secret Subject"))
+        XCTAssertTrue(s.contains("hello world"))
+    }
+
+    /// CR/LF in the subject value must be neutralized. Without this,
+    /// a crafted subject `Secret\r\nBcc: victim@example.invalid\r\n\r\n`
+    /// terminates the entity's header block early and injects new
+    /// headers into the protected-headers MIME structure.
+    func testWrapWithProtectedHeaders_StripsCRLFFromSubject() {
+        let inner = Data("body\r\n".utf8)
+        let wrapped = PGPMimeBuilder.wrapWithProtectedHeaders(
+            inner: inner,
+            subject: "Secret\r\nBcc: victim@example.invalid\r\n\r\ninjected"
+        )
+        let s = String(data: wrapped, encoding: .utf8) ?? ""
+        // Subject line is one line, ending at the next CRLF that
+        // wrap appends. No `Bcc:` should appear as its own header.
+        let lines = s.split(separator: "\r\n", omittingEmptySubsequences: false)
+        let bccLines = lines.filter { $0.hasPrefix("Bcc:") }
+        XCTAssertTrue(bccLines.isEmpty, "Bcc must not survive as its own header line: \(bccLines)")
+    }
+}
+
+// MARK: - Encrypted-envelope subject override + autocrypt header
+
+final class PGPMimeBuilderEncryptedEnvelopeTests: XCTestCase {
+
+    /// `subjectOverride: "..."` replaces the outer envelope's
+    /// `Subject:` value (chithi's F3 cleartext placeholder pattern).
+    func testBuildEncryptedMessage_SubjectOverrideReplacesOuterSubject() throws {
+        let original = Data(
+            ("From: alice@example.com\n"
+             + "To: bob@example.com\n"
+             + "Subject: Real Subject\n"
+             + "Content-Type: text/plain\n"
+             + "\nhello\n").utf8
+        )
+        let armor = Data("-----BEGIN PGP MESSAGE-----\nAAAA\n-----END PGP MESSAGE-----\n".utf8)
+        let encoded = try PGPMimeBuilder.buildEncryptedMessage(
+            original: original,
+            armoredCiphertext: armor,
+            innerWasSigned: false,
+            autocryptHeader: nil,
+            subjectOverride: "..."
+        )
+        let s = String(data: encoded.bytes, encoding: .utf8) ?? ""
+        // Outer Subject is replaced with the placeholder.
+        XCTAssertTrue(s.contains("Subject: ..."))
+        XCTAssertFalse(s.contains("Subject: Real Subject"))
+    }
+
+    /// When `autocryptHeader:` is non-nil the value appears verbatim
+    /// after MIME-Version on the outer envelope of both signed and
+    /// encrypted builds.
+    func testBuildEncryptedMessage_EmitsAutocryptHeaderWhenProvided() throws {
+        let original = Data("From: a@x\nTo: b@y\nSubject: hi\nContent-Type: text/plain\n\nb\n".utf8)
+        let armor = Data("-----BEGIN PGP MESSAGE-----\nAAAA\n-----END PGP MESSAGE-----\n".utf8)
+        let header = "Autocrypt: addr=a@x; prefer-encrypt=mutual; keydata=AAAA"
+        let encoded = try PGPMimeBuilder.buildEncryptedMessage(
+            original: original,
+            armoredCiphertext: armor,
+            innerWasSigned: false,
+            autocryptHeader: header
+        )
+        let s = String(data: encoded.bytes, encoding: .utf8) ?? ""
+        XCTAssertTrue(s.contains(header))
+    }
+
+    func testBuildSignedMessage_EmitsAutocryptHeaderWhenProvided() throws {
+        let original = Data("From: a@x\nTo: b@y\nSubject: hi\nContent-Type: text/plain\n\nbody\n".utf8)
+        let sig = Data("-----BEGIN PGP SIGNATURE-----\nABCD\n-----END PGP SIGNATURE-----\n".utf8)
+        let inner = Data("Content-Type: text/plain\n\nbody\n".utf8)
+        let header = "Autocrypt: addr=a@x; prefer-encrypt=mutual; keydata=AAAA"
+        let encoded = try PGPMimeBuilder.buildSignedMessage(
+            original: original,
+            innerPart: inner,
+            armoredSignature: sig,
+            micalg: "pgp-sha256",
+            autocryptHeader: header
+        )
+        let s = String(data: encoded.bytes, encoding: .utf8) ?? ""
+        XCTAssertTrue(s.contains(header))
+    }
+
+    /// Lone-trailing-LF fix: when the armor ends in bare `\n` AND the
+    /// envelope is CRLF, the bytes between the armor and the closing
+    /// boundary must be CRLF (not `\n\r\n`). Mirror of chithi
+    /// 214daf0c's `wrap_pgp_mime_encrypted` fix.
+    func testBuildEncryptedMessage_LoneTrailingLFPoppedAndReplacedWithCRLF() throws {
+        let original = Data("From: a@x\r\nTo: b@y\r\nSubject: hi\r\nContent-Type: text/plain\r\n\r\nbody\r\n".utf8)
+        let armor = Data("-----BEGIN PGP MESSAGE-----\r\nAAAA\r\n-----END PGP MESSAGE-----\n".utf8)
+        let encoded = try PGPMimeBuilder.buildEncryptedMessage(
+            original: original,
+            armoredCiphertext: armor,
+            innerWasSigned: false
+        )
+        // No `\n\r\n` (bare LF followed by CRLF) anywhere in the
+        // encoded bytes — every line must terminate with CRLF.
+        let bytes = [UInt8](encoded.bytes)
+        for i in 0..<(bytes.count - 2) {
+            if bytes[i] == 0x0A {
+                // After any 0x0A, the previous byte must be 0x0D.
+                XCTAssertTrue(i > 0 && bytes[i - 1] == 0x0D,
+                              "bare LF found at offset \(i)")
+            }
+        }
+    }
+}
+
+// MARK: - F1 application/pgp-keys attachment
+
+final class PGPMimeBuilderPubkeyAttachmentTests: XCTestCase {
+
+    func testWrapWithPubkeyAttachment_AttachesAsApplicationPgpKeys() {
+        let inner = Data("Content-Type: text/plain\r\n\r\nhello\r\n".utf8)
+        let armoredPubkey = "-----BEGIN PGP PUBLIC KEY BLOCK-----\r\nDATA\r\n-----END PGP PUBLIC KEY BLOCK-----\r\n"
+        let longKeyId = "ABCDEF0123456789"
+        let wrapped = PGPMimeBuilder.wrapWithPubkeyAttachment(
+            inner: inner,
+            armoredPubkey: armoredPubkey,
+            longKeyId: longKeyId
+        )
+        let s = String(data: wrapped, encoding: .utf8) ?? ""
+        XCTAssertTrue(s.contains("multipart/mixed"))
+        XCTAssertTrue(s.contains("application/pgp-keys"))
+        XCTAssertTrue(s.contains("OpenPGP_0x\(longKeyId).asc"))
+        XCTAssertTrue(s.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----"))
+        XCTAssertTrue(s.contains("hello"))
+    }
+}
+
+// MARK: - Protected-headers recovery on inbound (F3 decode)
+
+final class PGPMimeParserProtectedHeadersTests: XCTestCase {
+
+    /// When the decrypted plaintext is a protected-headers v1
+    /// wrapper, `recoverProtectedSubject` lifts the real Subject and
+    /// returns the inner part body for rendering.
+    func testRecoverProtectedSubject_LiftsInnerSubjectAndStripsWrapper() {
+        let inner = Data("Content-Type: text/plain; charset=us-ascii\r\n\r\nhello\r\n".utf8)
+        let wrapped = PGPMimeBuilder.wrapWithProtectedHeaders(inner: inner, subject: "Real")
+        let outcome = PGPMimeParser.recoverProtectedSubject(plaintext: wrapped)
+        XCTAssertEqual(outcome.subject, "Real")
+        let inS = String(data: outcome.unwrappedBody, encoding: .utf8) ?? ""
+        XCTAssertTrue(inS.contains("hello"))
+        XCTAssertFalse(inS.contains("protected-headers"))
+    }
+
+    /// Pass-through when the plaintext is NOT a protected-headers
+    /// wrapper: subject = nil, body returned unchanged.
+    func testRecoverProtectedSubject_PassThroughOnPlainPlaintext() {
+        let plain = Data("Content-Type: text/plain\r\n\r\nhello\r\n".utf8)
+        let outcome = PGPMimeParser.recoverProtectedSubject(plaintext: plain)
+        XCTAssertNil(outcome.subject)
+        XCTAssertEqual(outcome.unwrappedBody, plain)
+    }
+}

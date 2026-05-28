@@ -93,18 +93,20 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
     func encrypt(
         plaintext: Data,
         recipientFingerprints: [String],
+        hiddenRecipientFingerprints: [String],
         signerFingerprint: String?,
         armor: Bool,
         reply: @escaping (Data?, [String], String?, String?, Bool, NSError?) -> Void
     ) {
         workQueue.async {
             svcLog.info(
-                "encrypt called — plaintextSize=\(plaintext.count) recipients=\(recipientFingerprints, privacy: .public) signer=\(signerFingerprint ?? "<none>", privacy: .public) armor=\(armor)"
+                "encrypt called — plaintextSize=\(plaintext.count) visible=\(recipientFingerprints, privacy: .public) hidden=\(hiddenRecipientFingerprints, privacy: .public) signer=\(signerFingerprint ?? "<none>", privacy: .public) armor=\(armor)"
             )
             do {
                 let ct = try self.runner.encrypt(
                     plaintext: plaintext,
                     recipients: recipientFingerprints,
+                    hiddenRecipients: hiddenRecipientFingerprints,
                     signerFingerprint: signerFingerprint,
                     armor: armor
                 )
@@ -123,6 +125,42 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
                     "encrypt FAILED — \(error.localizedDescription, privacy: .public) :: \(String(describing: error), privacy: .public)"
                 )
                 reply(nil, [], nil, nil, false, Self.nsError(error))
+            }
+        }
+    }
+
+    // MARK: - Key export (Autocrypt header + pgp-keys attachment)
+
+    func exportAutocryptKeydata(
+        fingerprint: String,
+        addr: String,
+        reply: @escaping (Data?, NSError?) -> Void
+    ) {
+        workQueue.async {
+            do {
+                let bytes = try self.runner.exportAutocryptKeydata(
+                    fingerprint: fingerprint,
+                    addr: addr
+                )
+                reply(bytes, nil)
+            } catch {
+                svcLog.info("exportAutocryptKeydata failed (best-effort): \(error.localizedDescription, privacy: .public)")
+                reply(nil, Self.nsError(error))
+            }
+        }
+    }
+
+    func exportPublicArmored(
+        fingerprint: String,
+        reply: @escaping (String?, NSError?) -> Void
+    ) {
+        workQueue.async {
+            do {
+                let armored = try self.runner.exportPublicArmored(fingerprint: fingerprint)
+                reply(armored, nil)
+            } catch {
+                svcLog.info("exportPublicArmored failed (best-effort): \(error.localizedDescription, privacy: .public)")
+                reply(nil, Self.nsError(error))
             }
         }
     }
@@ -234,6 +272,35 @@ final class TumpaCryptoService: NSObject, TumpaCryptoXPC {
         }
     }
 
+    // MARK: - Multi-key-per-address selection
+
+    func keysForEmail(
+        email: String,
+        reply: @escaping ([TumpaKeyInfo], NSError?) -> Void
+    ) {
+        workQueue.async {
+            do {
+                let keys = try self.runner.keysForEmail(email: email)
+                reply(keys, nil)
+            } catch {
+                reply([], Self.nsError(error))
+            }
+        }
+    }
+
+    func ambiguousAddresses(
+        reply: @escaping ([String], NSError?) -> Void
+    ) {
+        workQueue.async {
+            do {
+                let addresses = try self.runner.ambiguousAddresses()
+                reply(addresses, nil)
+            } catch {
+                reply([], Self.nsError(error))
+            }
+        }
+    }
+
     // MARK: - Helpers
 
     private static func nsError(_ error: Error) -> NSError {
@@ -280,6 +347,22 @@ final class TumpaCryptoServiceDelegate: NSObject, NSXPCListenerDelegate {
         exported.setClasses(
             NSSet(array: [NSDictionary.self, NSString.self]) as! Set<AnyHashable>,
             for: resolveSel,
+            argumentIndex: 0,
+            ofReply: true
+        )
+
+        let keysForEmailSel = #selector(TumpaCryptoXPC.keysForEmail(email:reply:))
+        exported.setClasses(
+            NSSet(array: [NSArray.self, TumpaKeyInfo.self, NSString.self]) as! Set<AnyHashable>,
+            for: keysForEmailSel,
+            argumentIndex: 0,
+            ofReply: true
+        )
+
+        let ambiguousSel = #selector(TumpaCryptoXPC.ambiguousAddresses(reply:))
+        exported.setClasses(
+            NSSet(array: [NSArray.self, NSString.self]) as! Set<AnyHashable>,
+            for: ambiguousSel,
             argumentIndex: 0,
             ofReply: true
         )

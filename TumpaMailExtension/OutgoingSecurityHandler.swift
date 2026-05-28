@@ -132,6 +132,25 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
     private var alwaysSignPreference: Bool {
         sharedDefaults?.bool(forKey: TumpaMailDefaults.alwaysSign) ?? false
     }
+    /// F1 — attach the sender's full ASCII-armored public key as a
+    /// `application/pgp-keys` MIME part on outbound signed messages.
+    /// Default-on (Thunderbird convention). `object(forKey:) as?
+    /// Bool ?? true` is what gives us the default — plain
+    /// `bool(forKey:)` returns false for an unset key.
+    private var attachPubkeyOnSignPreference: Bool {
+        sharedDefaults?.object(forKey: TumpaMailDefaults.attachPubkeyOnSign) as? Bool ?? true
+    }
+    /// F2 — emit an `Autocrypt:` header (with `prefer-encrypt=mutual`
+    /// and folded base64 keydata) on every outbound signed and/or
+    /// encrypted message. Default-on.
+    private var autocryptHeaderPreference: Bool {
+        sharedDefaults?.object(forKey: TumpaMailDefaults.autocryptHeader) as? Bool ?? true
+    }
+    /// F3 — encrypt the subject (draft-lamps-header-protection v1).
+    /// Default-on.
+    private var encryptSubjectPreference: Bool {
+        sharedDefaults?.object(forKey: TumpaMailDefaults.encryptSubject) as? Bool ?? true
+    }
 
     // MARK: - MEMessageEncoder (outgoing)
 
@@ -486,6 +505,25 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
                 signingError: signingError,
                 encryptionError: nil
             )
+            // F3: recover the protected Subject if the decrypted body
+            // is a protected-headers v1 wrapper
+            // (draft-ietf-lamps-header-protection). When recovered:
+            // strip the wrapper from the body the user reads AND lift
+            // the real subject into a per-call `envelopeSource` whose
+            // outer Subject is rewritten — so Mail's library indexer
+            // sees the real subject in the decoded message bytes
+            // (search, threading, message-list row all key off
+            // `MEDecodedMessage.data`'s envelope metadata).
+            // Pass-through when the plaintext isn't a v1 wrapper.
+            let recovery = PGPMimeParser.recoverProtectedSubject(plaintext: bodyForAssembly)
+            bodyForAssembly = recovery.unwrappedBody
+            let envelopeSourceForAssembly: Data = {
+                if let recovered = recovery.subject {
+                    return rewriteOuterSubject(in: original, to: recovered)
+                }
+                return original
+            }()
+
             // Hand Mail's reader a complete RFC 822 message — outer
             // envelope (From/To/Subject/Date/...) from the encrypted
             // wrapper plus the decrypted inner part. Returning just
@@ -496,7 +534,7 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             // assembly fails — better an inner-part-only render than
             // nothing.
             let assembled = (try? PGPMimeBuilder.assembleInboundDecodedMessage(
-                envelopeSource: original,
+                envelopeSource: envelopeSourceForAssembly,
                 decryptedInnerPart: bodyForAssembly
             )) ?? bodyForAssembly
             return MEDecodedMessage(
@@ -994,40 +1032,92 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         shouldEncrypt: Bool
     ) async throws -> MEEncodedOutgoingMessage {
         let signer = try await resolveSignerFingerprint(message: message, sign: shouldSign)
-        var recipientFprs = try await resolveRecipientFingerprints(
+        var recipients = try await resolveRecipientFingerprints(
             message: message,
             encrypt: shouldEncrypt
         )
 
+        // F2 / Autocrypt: build the outer-envelope header value once,
+        // used by both the encrypted and signed branches below.
+        // Best-effort — a failed export logs at .info and proceeds
+        // without the header (never fail the send). The header rides
+        // on every sign or encrypt outbound (Autocrypt §2.1).
+        let autocryptHeader: String? = await buildAutocryptHeaderIfEnabled(
+            message: message,
+            signerFingerprint: signer
+        )
+
+        // F1 / pgp-keys: when signing AND the toggle is on, fetch the
+        // sender's full armored cert + long key id so we can wrap the
+        // inner part in a multipart/mixed envelope that adds the
+        // attachment alongside the original body. The attachment ends
+        // up under the signature (signed-only) or sealed inside the
+        // ciphertext (sign-then-encrypt) so a recipient can import
+        // the sender's pubkey directly. Disabled when not signing —
+        // there's no point shipping the sender's pubkey on a plain
+        // encrypted message (the recipient can't verify it anyway).
+        let pubkeyAttachment: (armoredPubkey: String, longKeyId: String)? =
+            await fetchPubkeyAttachmentIfEnabled(
+                shouldSign: shouldSign,
+                signerFingerprint: signer
+            )
+
         if shouldEncrypt {
-            // Always include the sender's own encryption key in the
-            // recipient set. The Sent copy that MFLibrary writes to
-            // disk needs to be decryptable on this same machine, or
-            // Mail's background indexer's decode attempt fails and
-            // crashes Mail with `*** -[__NSSetM addObject:]: object
-            // cannot be nil` via a KVO re-entrancy path inside
-            // MFLibrary's library-write NSOperation. Adding the
-            // sender keeps the Sent copy decryptable and makes the
-            // crash unreachable. (Independent of the cache fix
-            // below — both defenses are needed.)
+            // Sender-self dedup across BOTH lists. The Sent copy that
+            // MFLibrary writes to disk needs to be decryptable on
+            // this machine, or the background indexer crashes Mail
+            // with `*** -[__NSSetM addObject:]: object cannot be
+            // nil` via a KVO re-entrancy path inside MFLibrary's
+            // library-write NSOperation. Adding the sender to the
+            // visible list keeps the Sent copy decryptable; the
+            // not-in-hidden check covers the case where the user
+            // Bccs themselves (avoid double-encrypt-to-self).
             if let senderFpr = try? await resolveSenderEncryptionFingerprint(message: message),
                !senderFpr.isEmpty,
-               !recipientFprs.contains(senderFpr) {
-                recipientFprs.append(senderFpr)
-                log.info("encode: appended sender's key to encrypt recipients (\(senderFpr, privacy: .public))")
+               !recipients.visible.contains(senderFpr),
+               !recipients.hidden.contains(senderFpr) {
+                recipients = ResolvedRecipients(
+                    visible: recipients.visible + [senderFpr],
+                    hidden: recipients.hidden
+                )
+                log.info("encode: appended sender's key to visible encrypt recipients (\(senderFpr, privacy: .public))")
             }
 
-            // Sign-then-encrypt (or encrypt-only) into a single
-            // OpenPGP message; PGP/MIME wraps the result.
-            let plaintext = try PGPMimeBuilder.extractInnerPart(from: rawMessage)
+            // Inner-part extraction. F1 wraps the inner part in a
+            // multipart/mixed envelope adding a application/pgp-keys
+            // child. F3 then wraps THAT in a protected-headers v1
+            // envelope carrying the real Subject. Both wrappers are
+            // CRLF-canonical; the result becomes the plaintext we
+            // hand to the encryption pipeline.
+            var plaintext = try PGPMimeBuilder.extractInnerPart(from: rawMessage)
+            if let p = pubkeyAttachment {
+                plaintext = PGPMimeBuilder.wrapWithPubkeyAttachment(
+                    inner: plaintext,
+                    armoredPubkey: p.armoredPubkey,
+                    longKeyId: p.longKeyId
+                )
+            }
+            // F3: protected-headers v1 wrapping happens only on the
+            // encrypted path (the wrapper is meaningful only when
+            // sealed inside the ciphertext — otherwise it's just
+            // visible in the cleartext).
+            let realSubject = headerValue("subject", in: message) ?? ""
+            let wantsSubjectProtection = encryptSubjectPreference && !realSubject.isEmpty
+            if wantsSubjectProtection {
+                plaintext = PGPMimeBuilder.wrapWithProtectedHeaders(
+                    inner: plaintext,
+                    subject: realSubject
+                )
+            }
             log.info(
-                "encode: calling xpc.encrypt — plaintextSize=\(plaintext.count) recipients=\(recipientFprs, privacy: .public) signer=\(shouldSign ? (signer ?? "<nil>") : "<none>", privacy: .public)"
+                "encode: calling xpc.encrypt — plaintextSize=\(plaintext.count) visible=\(recipients.visible, privacy: .public) hidden=\(recipients.hidden, privacy: .public) signer=\(shouldSign ? (signer ?? "<nil>") : "<none>", privacy: .public) f1=\(pubkeyAttachment != nil) f3=\(wantsSubjectProtection)"
             )
             let armored: Data
             do {
                 armored = try await xpcEncrypt(
                     plaintext: plaintext,
-                    recipients: recipientFprs,
+                    visibleRecipients: recipients.visible,
+                    hiddenRecipients: recipients.hidden,
                     signer: shouldSign ? signer : nil
                 )
             } catch {
@@ -1040,7 +1130,14 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             let encoded = try PGPMimeBuilder.buildEncryptedMessage(
                 original: rawMessage,
                 armoredCiphertext: armored,
-                innerWasSigned: shouldSign
+                innerWasSigned: shouldSign,
+                autocryptHeader: autocryptHeader,
+                // F3 placeholder: chithi convention is "..." for the
+                // outer Subject when the real subject lives inside
+                // the ciphertext. Recipients aware of
+                // protected-headers v1 recover the real subject on
+                // decrypt; others see only the placeholder.
+                subjectOverride: wantsSubjectProtection ? "..." : nil
             )
 
             // Pre-build a decoded result for the bytes we just
@@ -1106,7 +1203,17 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         }
 
         // shouldSign && !shouldEncrypt — multipart/signed path.
-        let inner = try PGPMimeBuilder.extractInnerPart(from: rawMessage)
+        var inner = try PGPMimeBuilder.extractInnerPart(from: rawMessage)
+        // F1 — wrap the inner part with a application/pgp-keys
+        // sibling BEFORE canonicalizing for signing, so the
+        // attachment is covered by the signature.
+        if let p = pubkeyAttachment {
+            inner = PGPMimeBuilder.wrapWithPubkeyAttachment(
+                inner: inner,
+                armoredPubkey: p.armoredPubkey,
+                longKeyId: p.longKeyId
+            )
+        }
         let canon = PGPMimeBuilder.canonicalizeForSigning(inner)
         guard let signer = signer else {
             throw TumpaSendError.signing("no signing key available; pick a default signer in Tumpa Mail.")
@@ -1127,7 +1234,8 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
             original: rawMessage,
             innerPart: inner,
             armoredSignature: result.signature,
-            micalg: micalg
+            micalg: micalg,
+            autocryptHeader: autocryptHeader
         )
 
         // Pre-cache the decoded result for the Sent copy of this
@@ -1251,6 +1359,97 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         return keys.first(where: { $0.fingerprint == fingerprint })?.primaryUid
     }
 
+    /// Rewrite the outer envelope's `Subject:` value in an RFC 822
+    /// blob. Used on the F3 inbound decode path: when the protected-
+    /// headers v1 wrapper carries the real Subject, we surface it on
+    /// the decoded message's envelope so Mail's library indexer and
+    /// message-list row pick up the real subject instead of the
+    /// cleartext placeholder ("...").
+    ///
+    /// Best-effort: any failure (no header/body split, no Subject
+    /// header, etc.) returns the input unchanged. CR/LF stripped
+    /// from the new value for the same hand-built-header injection
+    /// defense as the outbound F3 wrap.
+    private func rewriteOuterSubject(in raw: Data, to newSubject: String) -> Data {
+        guard let split = try? PGPMimeBuilder.splitHeadersAndBody(raw) else { return raw }
+        let sanitized = newSubject
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+        let mutated = split.headers.map { h -> PGPMimeBuilder.ParsedHeader in
+            if h.name.lowercased() == "subject" {
+                return PGPMimeBuilder.ParsedHeader(name: h.name, value: sanitized)
+            }
+            return h
+        }
+        // Reuse the builder's detector so the rewritten envelope keeps
+        // the same line-ending style Mail handed us.
+        let eol = PGPMimeBuilder.detectLineEnding(in: raw)
+        var out = Data()
+        for h in mutated {
+            out.append("\(h.name): \(h.value)".data(using: .utf8)!)
+            out.append(eol)
+        }
+        out.append(eol)
+        out.append(split.body)
+        return out
+    }
+
+    /// F2 build helper: format the `Autocrypt:` header value for the
+    /// outbound message's From-address signer, or return `nil` when
+    /// the toggle is off or anything fails. Best-effort: a failed
+    /// keydata export logs at `.info` and proceeds without a header.
+    private func buildAutocryptHeaderIfEnabled(
+        message: MEMessage,
+        signerFingerprint: String?
+    ) async -> String? {
+        guard autocryptHeaderPreference else { return nil }
+        let from = message.fromAddress.addressString ?? message.fromAddress.rawString
+        guard !from.isEmpty else { return nil }
+        // The header needs a signing-capable fingerprint to pull the
+        // keydata for. If we have one explicitly (sign / sign+encrypt
+        // path), use that; otherwise resolve from the From address
+        // (encrypt-only path can still emit Autocrypt if the sender
+        // has a key in the keystore).
+        let fp: String?
+        if let signerFingerprint, !signerFingerprint.isEmpty {
+            fp = signerFingerprint
+        } else if let resolved = try? await xpc.resolveRecipients([from]), let r = resolved[from] {
+            fp = r
+        } else {
+            fp = nil
+        }
+        guard let fp else {
+            log.info("Autocrypt: no keystore fingerprint for From=\(from, privacy: .public); skipping header")
+            return nil
+        }
+        guard let keydata = await xpc.exportAutocryptKeydata(fingerprint: fp, addr: from) else {
+            log.info("Autocrypt: exportAutocryptKeydata returned nil for \(fp, privacy: .public); skipping header")
+            return nil
+        }
+        return PGPMimeBuilder.formatAutocryptHeader(addr: from, keydata: keydata)
+    }
+
+    /// F1 fetch helper: when signing AND the toggle is on, fetch the
+    /// signer's full armored public cert plus the 16-char long key id
+    /// for the attachment filename. Returns nil when disabled or any
+    /// step fails (best-effort: missing pubkey is non-fatal).
+    private func fetchPubkeyAttachmentIfEnabled(
+        shouldSign: Bool,
+        signerFingerprint: String?
+    ) async -> (armoredPubkey: String, longKeyId: String)? {
+        guard shouldSign, attachPubkeyOnSignPreference else { return nil }
+        guard let fp = signerFingerprint, !fp.isEmpty else { return nil }
+        guard let armored = await xpc.exportPublicArmored(fingerprint: fp) else {
+            log.info("attachPubkeyOnSign: exportPublicArmored failed for \(fp, privacy: .public); skipping attachment")
+            return nil
+        }
+        // Long key id = the trailing 16 hex chars of the 40-char
+        // fingerprint, uppercase. Thunderbird's filename convention is
+        // `OpenPGP_0x<long-keyid>.asc`.
+        let longKeyId = String(fp.uppercased().suffix(16))
+        return (armoredPubkey: armored, longKeyId: longKeyId)
+    }
+
     /// Resolve the sender's encryption-capable cert fingerprint from
     /// the From address. Returns nil (not throws) on miss because the
     /// caller treats this as a defense-in-depth append, not a hard
@@ -1263,8 +1462,45 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
               !from.isEmpty else {
             return nil
         }
+        if let pinned = await overrideEncryptionFingerprint(forEmail: from) {
+            return pinned
+        }
         let resolved = try await xpc.resolveRecipients([from])
         return resolved[from]
+    }
+
+    /// When the user has pinned a signing key for `email` in the host's
+    /// Key Selection pane (an address with more than one usable cert),
+    /// return that fingerprint — but only after confirming it's still a
+    /// usable, signable candidate (`isSecret || hasCard`) for the
+    /// address. Returns `nil` when no override is set or it no longer
+    /// applies, so the caller falls back to first-match resolution. The
+    /// `keysForEmail` round-trip is only paid when an override exists.
+    private func overrideSigningFingerprint(forEmail email: String) async -> String? {
+        guard let pinned = TumpaKeyOverrides.signingFingerprint(
+            forEmail: email, in: sharedDefaults
+        ) else { return nil }
+        let candidates = (try? await xpc.keysForEmail(email)) ?? []
+        let ok = candidates.contains {
+            $0.fingerprint.caseInsensitiveCompare(pinned) == .orderedSame
+                && ($0.isSecret || $0.hasCard)
+        }
+        return ok ? pinned : nil
+    }
+
+    /// Encryption-side analogue of `overrideSigningFingerprint`. Any
+    /// usable cert for the address is a valid encryption target (no
+    /// secret-material requirement), so the only guard is that the
+    /// pinned fingerprint is still among the address's candidates.
+    private func overrideEncryptionFingerprint(forEmail email: String) async -> String? {
+        guard let pinned = TumpaKeyOverrides.encryptionFingerprint(
+            forEmail: email, in: sharedDefaults
+        ) else { return nil }
+        let candidates = (try? await xpc.keysForEmail(email)) ?? []
+        let ok = candidates.contains {
+            $0.fingerprint.caseInsensitiveCompare(pinned) == .orderedSame
+        }
+        return ok ? pinned : nil
     }
 
     /// Pick a signing fingerprint by matching the message's From
@@ -1284,6 +1520,9 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         if !sign { return nil }
 
         let from = message.fromAddress.addressString ?? message.fromAddress.rawString
+        if let pinned = await overrideSigningFingerprint(forEmail: from) {
+            return pinned
+        }
         let resolved = try await xpc.resolveRecipients([from])
         if let fp = resolved[from] {
             return fp
@@ -1293,31 +1532,58 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         )
     }
 
-    /// Resolve every To / Cc / Bcc recipient, throw with the missing
-    /// list if any is unresolvable.
+    /// Resolved recipient set: visible (To + Cc) go in standard
+    /// PKESK packets exposing the key id; hidden (Bcc) go in
+    /// throw-keyid PKESK packets with the all-zero wildcard
+    /// (RFC 4880), so a To/Cc recipient running `gpg --list-packets`
+    /// on the ciphertext can't enumerate the Bcc list.
+    struct ResolvedRecipients {
+        let visible: [String]
+        let hidden: [String]
+    }
+
+    /// Resolve To/Cc → visible and Bcc → hidden recipient fingerprints,
+    /// throwing with the missing list if any chip is unresolvable.
+    ///
+    /// Resolution goes through a single XPC `resolveRecipients` call
+    /// across the union of all three address lists so the "no usable
+    /// key for X" error names every missing chip — same UX as the
+    /// pre-BCC-split implementation.
     private func resolveRecipientFingerprints(
         message: MEMessage,
         encrypt: Bool
-    ) async throws -> [String] {
-        if !encrypt { return [] }
-        let addrs = (message.toAddresses + message.ccAddresses + message.bccAddresses)
-        let strings = addrs.compactMap { $0.addressString ?? $0.rawString }
-        let resolved = try await xpc.resolveRecipients(strings)
-        var fps: [String] = []
+    ) async throws -> ResolvedRecipients {
+        if !encrypt { return ResolvedRecipients(visible: [], hidden: []) }
+        let visibleAddrs = (message.toAddresses + message.ccAddresses)
+            .compactMap { $0.addressString ?? $0.rawString }
+        let hiddenAddrs = message.bccAddresses
+            .compactMap { $0.addressString ?? $0.rawString }
+        let union = visibleAddrs + hiddenAddrs
+        let resolved = try await xpc.resolveRecipients(union)
+
+        var visible: [String] = []
+        var hidden: [String] = []
         var missing: [String] = []
-        for s in strings {
-            if let fp = resolved[s] {
-                fps.append(fp)
-            } else {
-                missing.append(s)
-            }
+        for s in visibleAddrs {
+            if let pinned = await overrideEncryptionFingerprint(forEmail: s) {
+                visible.append(pinned)
+            } else if let fp = resolved[s] {
+                visible.append(fp)
+            } else { missing.append(s) }
+        }
+        for s in hiddenAddrs {
+            if let pinned = await overrideEncryptionFingerprint(forEmail: s) {
+                hidden.append(pinned)
+            } else if let fp = resolved[s] {
+                hidden.append(fp)
+            } else { missing.append(s) }
         }
         if !missing.isEmpty {
             throw TumpaSendError.encryption(
                 "No usable key for: \(missing.joined(separator: ", "))"
             )
         }
-        return fps
+        return ResolvedRecipients(visible: visible, hidden: hidden)
     }
 
     private func xpcSign(
@@ -1339,13 +1605,15 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
 
     private func xpcEncrypt(
         plaintext: Data,
-        recipients: [String],
+        visibleRecipients: [String],
+        hiddenRecipients: [String],
         signer: String?
     ) async throws -> Data {
         do {
             return try await xpc.encrypt(
                 plaintext: plaintext,
-                recipientFingerprints: recipients,
+                recipientFingerprints: visibleRecipients,
+                hiddenRecipientFingerprints: hiddenRecipients,
                 signerFingerprint: signer,
                 armor: true
             )
