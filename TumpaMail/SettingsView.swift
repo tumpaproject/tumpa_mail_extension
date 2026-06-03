@@ -29,6 +29,30 @@ struct SettingsView: View {
     )
     private var preferEncryptedReplies: Bool = true
 
+    // F1 / F2 / F3 — default-on; the .appex's accessors fall back to
+    // `true` for unset keys via `object(forKey:) as? Bool ?? true`, so
+    // a fresh install with no `register(defaults:)` call still picks
+    // up the right behavior. @AppStorage's default-value parameter
+    // here only governs the initial UI render (off → toggle off,
+    // first-paint mismatch).
+    @AppStorage(
+        TumpaMailDefaults.attachPubkeyOnSign,
+        store: UserDefaults(suiteName: TumpaMailSharedSuite)
+    )
+    private var attachPubkeyOnSign: Bool = true
+
+    @AppStorage(
+        TumpaMailDefaults.autocryptHeader,
+        store: UserDefaults(suiteName: TumpaMailSharedSuite)
+    )
+    private var autocryptHeader: Bool = true
+
+    @AppStorage(
+        TumpaMailDefaults.encryptSubject,
+        store: UserDefaults(suiteName: TumpaMailSharedSuite)
+    )
+    private var encryptSubject: Bool = true
+
     var body: some View {
         Form {
             Section("Outgoing mail") {
@@ -38,6 +62,18 @@ struct SettingsView: View {
                     Text("SHA-384").tag("SHA384")
                     Text("SHA-512").tag("SHA512")
                 }
+                Toggle(
+                    "Attach my public key when signing",
+                    isOn: $attachPubkeyOnSign
+                )
+                Toggle(
+                    "Add Autocrypt header to outgoing messages",
+                    isOn: $autocryptHeader
+                )
+                Toggle(
+                    "Encrypt subject lines (protected headers)",
+                    isOn: $encryptSubject
+                )
             }
             Section("Incoming mail") {
                 Toggle(

@@ -115,6 +115,18 @@ final class XPCClient {
             argumentIndex: 0,
             ofReply: true
         )
+        iface.setClasses(
+            NSSet(array: [NSArray.self, TumpaKeyInfo.self, NSString.self]) as! Set<AnyHashable>,
+            for: #selector(TumpaCryptoXPC.keysForEmail(email:reply:)),
+            argumentIndex: 0,
+            ofReply: true
+        )
+        iface.setClasses(
+            NSSet(array: [NSArray.self, NSString.self]) as! Set<AnyHashable>,
+            for: #selector(TumpaCryptoXPC.ambiguousAddresses(reply:)),
+            argumentIndex: 0,
+            ofReply: true
+        )
         return iface
     }
 
@@ -139,6 +151,18 @@ final class XPCClient {
                     cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
                 } else {
                     cont.resume(returning: resolved)
+                }
+            }
+        }
+    }
+
+    func keysForEmail(_ email: String) async throws -> [TumpaKeyInfo] {
+        try await call { proxy, cont in
+            proxy.keysForEmail(email: email) { keys, e in
+                if let e = e {
+                    cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
+                } else {
+                    cont.resume(returning: keys)
                 }
             }
         }
@@ -235,6 +259,7 @@ final class XPCClient {
     func encrypt(
         plaintext: Data,
         recipientFingerprints: [String],
+        hiddenRecipientFingerprints: [String],
         signerFingerprint: String?,
         armor: Bool
     ) async throws -> Data {
@@ -242,6 +267,7 @@ final class XPCClient {
             proxy.encrypt(
                 plaintext: plaintext,
                 recipientFingerprints: recipientFingerprints,
+                hiddenRecipientFingerprints: hiddenRecipientFingerprints,
                 signerFingerprint: signerFingerprint,
                 armor: armor
             ) { ct, invalid, needsFp, needsUid, needsIsPin, e in
@@ -262,6 +288,38 @@ final class XPCClient {
                 } else {
                     cont.resume(throwing: XPCClientError.noResult)
                 }
+            }
+        }
+    }
+
+    /// Autocrypt-minimised public-key bytes for `Autocrypt:` `keydata=`.
+    /// Best-effort: returns nil on any failure rather than throwing so
+    /// the OutgoingSecurityHandler can log + proceed without the
+    /// header.
+    func exportAutocryptKeydata(fingerprint: String, addr: String) async -> Data? {
+        await withCheckedContinuation { cont in
+            do {
+                let p = try proxy()
+                p.exportAutocryptKeydata(fingerprint: fingerprint, addr: addr) { data, _ in
+                    cont.resume(returning: data)
+                }
+            } catch {
+                cont.resume(returning: nil)
+            }
+        }
+    }
+
+    /// Full ASCII-armored public certificate for the `application/pgp-keys`
+    /// attachment. Best-effort: returns nil on failure.
+    func exportPublicArmored(fingerprint: String) async -> String? {
+        await withCheckedContinuation { cont in
+            do {
+                let p = try proxy()
+                p.exportPublicArmored(fingerprint: fingerprint) { armored, _ in
+                    cont.resume(returning: armored)
+                }
+            } catch {
+                cont.resume(returning: nil)
             }
         }
     }

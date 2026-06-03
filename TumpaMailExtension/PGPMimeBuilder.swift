@@ -72,13 +72,30 @@ enum PGPMimeBuilder {
     private static let lf: Data = "\n".data(using: .ascii)!
     private static let crlfcrlf: Data = "\r\n\r\n".data(using: .ascii)!
 
-    /// Detect the line-ending style used by an RFC 822 message. Looks
-    /// at the first 4 KiB of headers — long enough to span the routing
-    /// headers plus a fold or two without scanning a whole multi-MB
-    /// body. Returns `\r\n` only when explicit CRLF is present;
-    /// otherwise `\n` (Apple Mail's native form).
+    /// Detect the line-ending style used by an RFC 822 message.
+    ///
+    /// Probes ONLY the header block — up to the first blank-line
+    /// separator (or 4 KiB, whichever comes first). Apple Mail's own
+    /// headers are reliably LF, but a reply that quotes an
+    /// Outlook/Exchange thread carries CRLF *body* content; if the
+    /// probe reached into that body it would mis-detect CRLF and make
+    /// us emit a CRLF envelope, which Mail's outbound `\n -> \r\n`
+    /// submission then doubles to `\r\r\n` on the wire (empty / mangled
+    /// body at the recipient). A genuine CRLF message still detects
+    /// CRLF: its header block uses `\r\n` too. Mirrors the
+    /// earliest-separator logic in `splitHeadersAndBody`.
     static func detectLineEnding(in data: Data) -> Data {
-        let probe = data.prefix(4096)
+        let cap = data.index(data.startIndex, offsetBy: min(4096, data.count))
+        let crlfSep = data.range(of: crlfcrlf)
+        let lfSep = data.range(of: "\n\n".data(using: .ascii)!)
+        let sepUpper: Data.Index
+        switch (crlfSep, lfSep) {
+        case (let r?, let l?): sepUpper = r.lowerBound <= l.lowerBound ? r.upperBound : l.upperBound
+        case (let r?, nil):    sepUpper = r.upperBound
+        case (nil, let l?):    sepUpper = l.upperBound
+        case (nil, nil):       sepUpper = cap
+        }
+        let probe = data.subdata(in: data.startIndex..<min(sepUpper, cap))
         return probe.range(of: crlf) != nil ? crlf : lf
     }
 
@@ -107,7 +124,8 @@ enum PGPMimeBuilder {
         original: Data,
         innerPart: Data,
         armoredSignature: Data,
-        micalg: String
+        micalg: String,
+        autocryptHeader: String? = nil
     ) throws -> EncodedRFC822 {
         let eol = detectLineEnding(in: original)
         let split = try splitHeadersAndBody(original)
@@ -120,6 +138,17 @@ enum PGPMimeBuilder {
         // strip Content-Transfer-Encoding (irrelevant for multipart).
         out.append(serializeHeaders(outerHeaders, eol: eol))
         appendHeader(into: &out, name: "MIME-Version", value: "1.0", eol: eol)
+        if let autocryptHeader, !autocryptHeader.isEmpty {
+            // The Autocrypt header rides on the outer envelope of every
+            // signed/encrypted message we emit (Autocrypt Level 1 §2.1).
+            // `autocryptHeader` is a complete RFC 5322 field — including
+            // line folds — without a trailing eol. Append the value
+            // verbatim then close with one eol. Recipients strip ALL
+            // whitespace from `keydata=` before decoding so the fold
+            // bytes don't survive into the parsed cert.
+            out.append(autocryptHeader.data(using: .utf8)!)
+            out.append(eol)
+        }
         appendHeader(
             into: &out,
             name: "Content-Type",
@@ -164,10 +193,7 @@ enum PGPMimeBuilder {
         appendHeader(into: &out, name: "Content-Disposition",
                      value: "attachment; filename=\"signature.asc\"", eol: eol)
         out.append(eol)
-        out.append(armoredSignature)
-        if !armoredSignature.hasSuffix(eol) && !armoredSignature.hasSuffix(crlf) {
-            out.append(eol)
-        }
+        appendArmoredPart(into: &out, armored: armoredSignature, eol: eol)
 
         out.append("--\(boundary)--".data(using: .ascii)!)
         out.append(eol)
@@ -182,17 +208,27 @@ enum PGPMimeBuilder {
     static func buildEncryptedMessage(
         original: Data,
         armoredCiphertext: Data,
-        innerWasSigned: Bool
+        innerWasSigned: Bool,
+        autocryptHeader: String? = nil,
+        subjectOverride: String? = nil
     ) throws -> EncodedRFC822 {
         let eol = detectLineEnding(in: original)
         let split = try splitHeadersAndBody(original)
-        let outerHeaders = retainOuterHeaders(split.headers)
+        let outerHeaders = retainOuterHeaders(
+            split.headers,
+            subjectOverride: subjectOverride
+        )
 
         let boundary = randomBoundary(prefix: "tumpa-encrypted")
         var out = Data()
 
         out.append(serializeHeaders(outerHeaders, eol: eol))
         appendHeader(into: &out, name: "MIME-Version", value: "1.0", eol: eol)
+        if let autocryptHeader, !autocryptHeader.isEmpty {
+            // Same Autocrypt placement as the signed-envelope path.
+            out.append(autocryptHeader.data(using: .utf8)!)
+            out.append(eol)
+        }
         appendHeader(
             into: &out,
             name: "Content-Type",
@@ -225,10 +261,7 @@ enum PGPMimeBuilder {
         appendHeader(into: &out, name: "Content-Disposition",
                      value: "inline; filename=\"encrypted.asc\"", eol: eol)
         out.append(eol)
-        out.append(armoredCiphertext)
-        if !armoredCiphertext.hasSuffix(eol) && !armoredCiphertext.hasSuffix(crlf) {
-            out.append(eol)
-        }
+        appendArmoredPart(into: &out, armored: armoredCiphertext, eol: eol)
 
         out.append("--\(boundary)--".data(using: .ascii)!)
         out.append(eol)
@@ -628,10 +661,28 @@ enum PGPMimeBuilder {
     /// dumping the encoded bytes during a Mail.app crash). Sent
     /// messages don't need any of these — Mail synthesizes new
     /// tracking metadata for the Sent-folder copy itself.
-    private static func retainOuterHeaders(_ all: [ParsedHeader]) -> [ParsedHeader] {
-        all.filter { !isInnerHeader(name: $0.name) }
+    private static func retainOuterHeaders(
+        _ all: [ParsedHeader],
+        subjectOverride: String? = nil
+    ) -> [ParsedHeader] {
+        // Strip CR/LF from the override before emitting — this value
+        // becomes the outer envelope's `Subject:` and is hand-spliced
+        // by `serializeHeaders`, bypassing any RFC 2047 encoder. A
+        // malformed override (or one carrying an injected `\r\nBcc:`)
+        // would otherwise punch through into a new header line.
+        let sanitizedOverride: String? = subjectOverride.map { raw in
+            raw.replacingOccurrences(of: "\r", with: " ")
+                .replacingOccurrences(of: "\n", with: " ")
+        }
+        return all.filter { !isInnerHeader(name: $0.name) }
             .filter { $0.name.lowercased() != "mime-version" }    // we re-emit
             .filter { !isAppleInternalHeader(name: $0.name) }
+            .map { h in
+                if let s = sanitizedOverride, h.name.lowercased() == "subject" {
+                    return ParsedHeader(name: h.name, value: s)
+                }
+                return h
+            }
     }
 
     /// Apple-Mail-internal compose-time headers we strip from the
@@ -682,6 +733,164 @@ enum PGPMimeBuilder {
         let bytes = (0..<16).map { _ in UInt8.random(in: 0...255) }
         let hex = bytes.map { String(format: "%02x", $0) }.joined()
         return "\(prefix)-\(hex)"
+    }
+
+    // MARK: - Armored-part emit (lone-LF safe)
+
+    /// Append `armored` (an OpenPGP ASCII-armored block) followed by
+    /// exactly one closing eol so the next `--boundary` line lands at
+    /// column 0. Defends against the chithi `wrap_pgp_mime_encrypted`
+    /// bug: if the armor ends with a bare `\n` AND the outer envelope
+    /// is CRLF, the naive "append eol when no eol suffix" path emits
+    /// `\n\r\n` — a bare LF followed by CRLF, which RFC 5322 forbids
+    /// and which strict parsers (chithi's
+    /// `pgp_mime::extract_encrypted_payload`) fail to recognise as a
+    /// boundary preamble. Pop the bare LF and re-terminate with the
+    /// envelope's eol instead. CRLF input + CRLF envelope passes
+    /// through unchanged (the `hasSuffix(eol)` branch wins).
+    private static func appendArmoredPart(into out: inout Data, armored: Data, eol: Data) {
+        if armored.hasSuffix(eol) {
+            // Armor already ends with the envelope's eol — emit verbatim.
+            out.append(armored)
+        } else if eol == crlf && armored.hasSuffix(lf) && !armored.hasSuffix(crlf) {
+            // CRLF envelope + bare-LF armor tail. Pop the LF and
+            // re-terminate with CRLF.
+            out.append(armored.subdata(in: armored.startIndex..<(armored.endIndex - 1)))
+            out.append(crlf)
+        } else if !armored.hasSuffix(crlf) {
+            // No matching tail at all (e.g. armor truncated). Append
+            // the envelope's eol to keep the boundary delimiter safe.
+            out.append(armored)
+            out.append(eol)
+        } else {
+            // CRLF tail under an LF envelope. Keep it as-is — Mail's
+            // submission will lift the surrounding bytes to CRLF and
+            // the recipient sees a uniform envelope.
+            out.append(armored)
+        }
+    }
+
+    // MARK: - Autocrypt header (F2)
+
+    /// RFC 5322-folded `Autocrypt:` header value (WITHOUT a trailing
+    /// CRLF — the caller closes the field with the envelope's eol).
+    ///
+    /// Always emits `prefer-encrypt=mutual` (a Tumpa Mail user with
+    /// Autocrypt on is signalling they want encrypted replies, matching
+    /// the Level 1 spec's recommended attribute for clients that
+    /// support encryption end-to-end). The `addr` value has CR/LF
+    /// stripped (defense in depth: this header is hand-assembled and
+    /// bypasses lettre/Foundation address validation, so a malformed
+    /// account address must not be allowed to inject a Bcc/Cc line).
+    /// `keydata` (binary OpenPGP from `exportAutocryptKeydata`) is
+    /// base64-encoded without internal line wraps, then folded onto
+    /// continuation lines 72 chars wide with a single-space FWS
+    /// prefix. Autocrypt Level 1 §2.1.1 says parsers strip ALL
+    /// whitespace from `keydata=` before base64-decoding, so the fold
+    /// width is purely cosmetic; 72 chars keeps every wire line under
+    /// the 78-column soft limit (1 leading space + 72 = 73).
+    static func formatAutocryptHeader(addr: String, keydata: Data) -> String {
+        let sanitizedAddr = addr.replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+        let b64 = keydata.base64EncodedString(options: [])
+        var out = "Autocrypt: addr=\(sanitizedAddr); prefer-encrypt=mutual; keydata="
+        // base64 output is pure ASCII so byte-index slicing is char-safe.
+        let width = 72
+        var idx = b64.startIndex
+        while idx < b64.endIndex {
+            let end = b64.index(idx, offsetBy: width, limitedBy: b64.endIndex) ?? b64.endIndex
+            out.append("\r\n ")
+            out.append(contentsOf: b64[idx..<end])
+            idx = end
+        }
+        return out
+    }
+
+    // MARK: - Public-key attachment (F1)
+
+    /// Wrap `inner` (the original outgoing message's inner MIME part)
+    /// plus a `application/pgp-keys` attachment carrying `armoredPubkey`
+    /// in a `multipart/mixed` envelope. The result becomes the new
+    /// inner part for the outer `multipart/signed` (or
+    /// `multipart/encrypted`) wrapper, so the attachment is covered
+    /// by the signature / sealed inside the ciphertext.
+    ///
+    /// Filename uses Thunderbird's `OpenPGP_0x<long-keyid>.asc` form
+    /// — interoperable with Thunderbird/Enigmail's auto-import path.
+    ///
+    /// CRLF-canonical throughout: this entity gets fed into
+    /// `canonicalizeForSigning` (signed path) or into the
+    /// encryption pipeline (encrypted path), both of which expect
+    /// CRLF and the outer envelope's eol-normalization happens later
+    /// in `buildSignedMessage` / `buildEncryptedMessage`. The Mail
+    /// submission `\n -> \r\n` step lifts this whole subtree to
+    /// canonical CRLF on the wire.
+    static func wrapWithPubkeyAttachment(
+        inner: Data,
+        armoredPubkey: String,
+        longKeyId: String
+    ) -> Data {
+        let boundary = randomBoundary(prefix: "tumpa-mixed")
+        var out = Data()
+        let crlf = self.crlf
+        out.append("Content-Type: multipart/mixed; boundary=\"\(boundary)\"".data(using: .ascii)!)
+        out.append(crlf)
+        out.append(crlf)
+        out.append("--\(boundary)".data(using: .ascii)!)
+        out.append(crlf)
+        out.append(inner)
+        if !inner.hasSuffix(crlf) { out.append(crlf) }
+        out.append("--\(boundary)".data(using: .ascii)!)
+        out.append(crlf)
+        out.append("Content-Type: application/pgp-keys; name=\"OpenPGP_0x\(longKeyId).asc\"".data(using: .ascii)!)
+        out.append(crlf)
+        out.append("Content-Description: OpenPGP public key".data(using: .ascii)!)
+        out.append(crlf)
+        out.append("Content-Disposition: attachment; filename=\"OpenPGP_0x\(longKeyId).asc\"".data(using: .ascii)!)
+        out.append(crlf)
+        out.append("Content-Transfer-Encoding: 7bit".data(using: .ascii)!)
+        out.append(crlf)
+        out.append(crlf)
+        out.append(armoredPubkey.data(using: .utf8)!)
+        if !armoredPubkey.hasSuffix("\r\n") { out.append(crlf) }
+        out.append("--\(boundary)--".data(using: .ascii)!)
+        out.append(crlf)
+        return out
+    }
+
+    // MARK: - Protected headers v1 (F3 — encrypt subject)
+
+    /// Wrap `inner` in a `multipart/mixed; protected-headers="v1"`
+    /// entity carrying the real `Subject:` inside its own header
+    /// block. The wrapped result is what gets encrypted; the outer
+    /// envelope's `Subject:` is replaced with a placeholder by the
+    /// caller (`buildEncryptedMessage(subjectOverride: "...")`).
+    /// Implements draft-ietf-lamps-header-protection v1.
+    ///
+    /// CR/LF in `subject` is collapsed to a single space — a header
+    /// value cannot legally contain bare CR/LF, and an embedded
+    /// `\r\n\r\n` would otherwise terminate this entity's header
+    /// block early and malform the encrypted MIME structure. Matches
+    /// the chithi-side `wrap_with_protected_headers` defense.
+    static func wrapWithProtectedHeaders(inner: Data, subject: String) -> Data {
+        let boundary = randomBoundary(prefix: "tumpa-protected")
+        let crlf = self.crlf
+        var out = Data()
+        out.append("Content-Type: multipart/mixed; protected-headers=\"v1\"; boundary=\"\(boundary)\"".data(using: .ascii)!)
+        out.append(crlf)
+        let cleanSubject = subject
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+        out.append("Subject: \(cleanSubject)".data(using: .utf8)!)
+        out.append(crlf)
+        out.append(crlf)
+        out.append("--\(boundary)".data(using: .ascii)!)
+        out.append(crlf)
+        out.append(inner)
+        if !inner.hasSuffix(crlf) { out.append(crlf) }
+        out.append("--\(boundary)--".data(using: .ascii)!)
+        out.append(crlf)
+        return out
     }
 }
 

@@ -131,6 +131,7 @@ public final class LibtumpaRunner {
     public func encrypt(
         plaintext: Data,
         recipients: [String],
+        hiddenRecipients: [String],
         signerFingerprint: String?,
         armor: Bool
     ) throws -> Data {
@@ -138,6 +139,7 @@ public final class LibtumpaRunner {
             let ct = try tumpa_uniffi_encrypt(
                 plaintext: plaintext,
                 recipients: recipients,
+                hiddenRecipients: hiddenRecipients,
                 signerFingerprint: signerFingerprint,
                 armor: armor,
                 // Only pass the SecretProvider when signing — the
@@ -152,6 +154,36 @@ public final class LibtumpaRunner {
         } catch {
             secretProvider.clearLastServedIfTransient()
             log.error("encrypt failed: \(String(describing: error), privacy: .public)")
+            throw translate(error)
+        }
+    }
+
+    // MARK: - Key export (Autocrypt header + pgp-keys attachment)
+
+    /// Autocrypt-minimised public key bytes for the `Autocrypt:`
+    /// header `keydata=` attribute. Wraps
+    /// `libtumpa::key::export_public_for_autocrypt`.
+    public func exportAutocryptKeydata(fingerprint: String, addr: String) throws -> Data {
+        do {
+            let bytes = try tumpa_uniffi_exportAutocryptKeydata(
+                fingerprint: fingerprint,
+                addr: addr
+            )
+            return Data(bytes)
+        } catch {
+            log.error("exportAutocryptKeydata failed: \(String(describing: error), privacy: .public)")
+            throw translate(error)
+        }
+    }
+
+    /// Full ASCII-armored transferable public key for the
+    /// `application/pgp-keys` outbound attachment. Wraps
+    /// `libtumpa::key::export_public_armored`.
+    public func exportPublicArmored(fingerprint: String) throws -> String {
+        do {
+            return try tumpa_uniffi_exportPublicArmored(fingerprint: fingerprint)
+        } catch {
+            log.error("exportPublicArmored failed: \(String(describing: error), privacy: .public)")
             throw translate(error)
         }
     }
@@ -331,6 +363,40 @@ public final class LibtumpaRunner {
             throw translate(error)
         }
     }
+
+    // MARK: - Multi-key-per-address selection
+
+    public func keysForEmail(email: String) throws -> [TumpaKeyInfo] {
+        do {
+            return try tumpa_uniffi_keysForEmail(email: email).map(Self.mapKeyInfo)
+        } catch {
+            log.error("keysForEmail failed: \(String(describing: error), privacy: .public)")
+            throw translate(error)
+        }
+    }
+
+    public func ambiguousAddresses() throws -> [String] {
+        do {
+            return try tumpa_uniffi_ambiguousAddresses()
+        } catch {
+            log.error("ambiguousAddresses failed: \(String(describing: error), privacy: .public)")
+            throw translate(error)
+        }
+    }
+
+    /// Shared `KeyInfo` → `TumpaKeyInfo` projection. `listKeys` predates
+    /// this and inlines the same fields; this helper backs the
+    /// multi-key picker paths.
+    private static func mapKeyInfo(_ k: KeyInfo) -> TumpaKeyInfo {
+        TumpaKeyInfo(
+            fingerprint: k.fingerprint,
+            primaryUid: k.primaryUid,
+            isSecret: k.isSecret,
+            hasCard: k.hasCard,
+            isRevoked: k.isRevoked,
+            isExpired: k.isExpired
+        )
+    }
 }
 
 // MARK: - Free-function shims
@@ -353,6 +419,7 @@ private func tumpa_uniffi_signDetached(
 private func tumpa_uniffi_encrypt(
     plaintext: Data,
     recipients: [String],
+    hiddenRecipients: [String],
     signerFingerprint: String?,
     armor: Bool,
     provider: SecretProvider?
@@ -360,10 +427,22 @@ private func tumpa_uniffi_encrypt(
     try encrypt(
         plaintext: plaintext,
         recipients: recipients,
+        hiddenRecipients: hiddenRecipients,
         signerFingerprint: signerFingerprint,
         armor: armor,
         provider: provider
     )
+}
+
+private func tumpa_uniffi_exportAutocryptKeydata(
+    fingerprint: String,
+    addr: String
+) throws -> Data {
+    try exportAutocryptKeydata(fingerprint: fingerprint, addr: addr)
+}
+
+private func tumpa_uniffi_exportPublicArmored(fingerprint: String) throws -> String {
+    try exportPublicArmored(fingerprint: fingerprint)
 }
 
 private func tumpa_uniffi_decryptAndVerify(
@@ -390,4 +469,12 @@ private func tumpa_uniffi_resolveRecipients(emails: [String]) throws -> [String:
 
 private func tumpa_uniffi_describeKey(fingerprint: String) throws -> String {
     try describeKey(fingerprint: fingerprint)
+}
+
+private func tumpa_uniffi_keysForEmail(email: String) throws -> [KeyInfo] {
+    try keysForEmail(email: email)
+}
+
+private func tumpa_uniffi_ambiguousAddresses() throws -> [String] {
+    try ambiguousAddresses()
 }

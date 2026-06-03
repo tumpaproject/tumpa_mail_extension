@@ -446,6 +446,77 @@ enum PGPMimeParser {
         return nil
     }
 
+    // MARK: - Protected headers v1 (F3 — encrypted subject)
+
+    /// Outcome of [`recoverProtectedSubject`].
+    struct ProtectedSubjectRecovery {
+        /// The real `Subject:` lifted from the protected-headers
+        /// inner entity, or `nil` when `plaintext` is not a
+        /// protected-headers v1 wrapper.
+        let subject: String?
+        /// The unwrapped inner body — the bytes the message viewer
+        /// should render. When `plaintext` was NOT a protected-headers
+        /// wrapper, this is `plaintext` returned unchanged.
+        let unwrappedBody: Data
+    }
+
+    /// Recover the encrypted subject from a decrypted plaintext that
+    /// was produced via [`PGPMimeBuilder.wrapWithProtectedHeaders`]
+    /// (draft-ietf-lamps-header-protection v1).
+    ///
+    /// Detection: the top-level `Content-Type` carries
+    /// `protected-headers="v1"`. If so, the entity's own header block
+    /// carries the real `Subject:` and the single child part holds
+    /// the actual body. We lift the Subject value and strip the
+    /// wrapper so the caller can render the inner part directly AND
+    /// rewrite the outer envelope's `Subject:` (placeholder) with the
+    /// real value before passing the decoded bytes back to Mail.
+    ///
+    /// If `plaintext` is not a protected-headers wrapper (i.e. it's
+    /// the unmodified pre-F3 shape, or any third-party encrypted
+    /// payload), the call is a pass-through: subject = nil,
+    /// unwrappedBody = plaintext.
+    static func recoverProtectedSubject(plaintext: Data) -> ProtectedSubjectRecovery {
+        // Best-effort parse. Any failure (malformed headers, missing
+        // protected-headers marker, no child part) routes to
+        // pass-through.
+        let passThrough = ProtectedSubjectRecovery(subject: nil, unwrappedBody: plaintext)
+
+        guard let split = try? PGPMimeBuilder.splitHeadersAndBody(plaintext) else {
+            return passThrough
+        }
+
+        // Must carry protected-headers="v1" on the wrapping entity's
+        // Content-Type. Other multipart/mixed entities are NOT touched
+        // — only those produced by our outbound F3 wrapper (or a
+        // compatible chithi / Thunderbird / K-9 sender) flow through.
+        let contentType = split.headers
+            .first(where: { $0.name.lowercased() == "content-type" })?
+            .value ?? ""
+        let phParam = PGPMimeParser.parseParameter(from: contentType, key: "protected-headers")
+        guard phParam?.lowercased() == "v1" else { return passThrough }
+
+        // Lift the protected Subject. Per draft-lamps-header-protection,
+        // only Subject is duplicated in v1; other headers ride on the
+        // outer envelope and stay there.
+        let protectedSubject = split.headers
+            .first(where: { $0.name.lowercased() == "subject" })?
+            .value
+
+        // Strip the wrapper. Single-child multipart/mixed: take the
+        // first sliced part — which is the original outgoing inner
+        // MIME part (Content-Type + body), the byte sequence the
+        // recipient's MUA actually wants to render.
+        guard let boundary = PGPMimeParser.parseBoundary(from: contentType) else {
+            return ProtectedSubjectRecovery(subject: protectedSubject, unwrappedBody: plaintext)
+        }
+        let parts = PGPMimeParser.sliceParts(body: split.body, boundary: boundary)
+        guard let inner = parts.first else {
+            return ProtectedSubjectRecovery(subject: protectedSubject, unwrappedBody: plaintext)
+        }
+        return ProtectedSubjectRecovery(subject: protectedSubject, unwrappedBody: inner)
+    }
+
     // MARK: - Helpers
 
     /// Strip a trailing CRLF / LF from `data`. Multipart parts we

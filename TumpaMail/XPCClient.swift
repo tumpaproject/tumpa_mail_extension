@@ -70,6 +70,18 @@ final class XPCClient: ObservableObject {
                 argumentIndex: 0,
                 ofReply: true
             )
+            conn.remoteObjectInterface!.setClasses(
+                NSSet(array: [NSArray.self, TumpaKeyInfo.self, NSString.self]) as! Set<AnyHashable>,
+                for: #selector(TumpaCryptoXPC.keysForEmail(email:reply:)),
+                argumentIndex: 0,
+                ofReply: true
+            )
+            conn.remoteObjectInterface!.setClasses(
+                NSSet(array: [NSArray.self, NSString.self]) as! Set<AnyHashable>,
+                for: #selector(TumpaCryptoXPC.ambiguousAddresses(reply:)),
+                argumentIndex: 0,
+                ofReply: true
+            )
 
             conn.invalidationHandler = { [weak self] in
                 Task { @MainActor in self?.connection = nil }
@@ -112,6 +124,38 @@ final class XPCClient: ObservableObject {
                         cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
                     } else {
                         cont.resume(returning: resolved)
+                    }
+                }
+            } catch {
+                cont.resume(throwing: error)
+            }
+        }
+    }
+
+    func keysForEmail(_ email: String) async throws -> [TumpaKeyInfo] {
+        try await withCheckedThrowingContinuation { cont in
+            do {
+                try proxy().keysForEmail(email: email) { keys, error in
+                    if let e = error {
+                        cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
+                    } else {
+                        cont.resume(returning: keys)
+                    }
+                }
+            } catch {
+                cont.resume(throwing: error)
+            }
+        }
+    }
+
+    func ambiguousAddresses() async throws -> [String] {
+        try await withCheckedThrowingContinuation { cont in
+            do {
+                try proxy().ambiguousAddresses { addresses, error in
+                    if let e = error {
+                        cont.resume(throwing: XPCClientError.remote(e.localizedDescription))
+                    } else {
+                        cont.resume(returning: addresses)
                     }
                 }
             } catch {

@@ -190,4 +190,26 @@ final class LibtumpaRunnerTests: XCTestCase {
             "passphrase required for Alice <alice@example.com>"
         )
     }
+
+    /// `encrypt(...)` now takes a `hiddenRecipients: [String]` slot.
+    /// Pinning the call with an empty hidden list against an empty
+    /// keystore confirms the FFI marshalling round-trips correctly:
+    /// the underlying Rust call returns the InvalidRecipients error,
+    /// which is the same shape as the pre-BCC path. Catches link
+    /// breakage between Swift call site and the regenerated UniFFI
+    /// stub.
+    func testEncryptWithEmptyHiddenList_RoundTripsThroughFFI() throws {
+        let runner = LibtumpaRunner()
+        try withFreshKeystore {
+            XCTAssertThrowsError(
+                try runner.encrypt(
+                    plaintext: Data("hello".utf8),
+                    recipients: ["nobody@example.invalid"],
+                    hiddenRecipients: [],
+                    signerFingerprint: nil,
+                    armor: true
+                )
+            )
+        }
+    }
 }

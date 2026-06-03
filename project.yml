@@ -210,6 +210,7 @@ targets:
       - path: Tests
       - path: TumpaMailExtension/PGPMimeBuilder.swift
       - path: TumpaMailExtension/PGPMimeParser.swift
+      - path: TumpaMailExtension/DecodedCache.swift
       - path: Shared/TumpaCryptoXPC.swift
       # Compile the libtumpa-binding-using files into the test bundle
       # so LibtumpaRunnerTests can exercise the FFI in-process.

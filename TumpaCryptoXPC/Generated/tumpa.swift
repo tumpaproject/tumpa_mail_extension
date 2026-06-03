@@ -1848,6 +1848,21 @@ fileprivate struct FfiConverterDictionaryStringString: FfiConverterRustBuffer {
     }
 }
 /**
+ * Lowercased email addresses that match MORE THAN ONE usable cert —
+ * i.e. the addresses where signing / encryption is ambiguous and the
+ * host UI should offer a per-address key picker. An address matched
+ * by zero or one usable cert is omitted (nothing to choose).
+ *
+ * Emails are collected across every UID of every usable cert, so an
+ * address that only appears as a secondary UID still surfaces.
+ */
+public func ambiguousAddresses()throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeTumpaError_lift) {
+    uniffi_tumpa_uniffi_fn_func_ambiguous_addresses($0
+    )
+})
+}
+/**
  * Decrypt+verify in one call. Returns plaintext plus a typed
  * signature outcome — the caller does NOT have to parse `[GNUPG:]`
  * status lines anymore.
@@ -1884,20 +1899,90 @@ public func describeKey(fingerprint: String)throws  -> String  {
 })
 }
 /**
- * Encrypt `plaintext` to `recipients`. If `signer_fingerprint` is
- * `Some`, also sign with that key (one-pass-signature inside the
- * ciphertext). Card-first dispatch on the signing leg is implemented
- * here in the wrapper — libtumpa exposes the software and card paths
- * as separate fns and leaves the dispatch to callers.
+ * Encrypt `plaintext` to a split visible / hidden recipient set.
+ *
+ * `recipients` are visible (To/Cc): their key id is exposed in the
+ * PKESK header. `hidden_recipients` are encoded with the RFC 4880
+ * throw-keyid wildcard (all-zero key id), so a visible recipient
+ * running `gpg --list-packets` on the ciphertext cannot enumerate
+ * the hidden (Bcc) set.
+ *
+ * If `signer_fingerprint` is `Some`, the message is sign-then-encrypted
+ * (one-pass-signature inside the ciphertext). Card-first dispatch on
+ * the signing leg is implemented here in the wrapper — libtumpa exposes
+ * the software and card paths as separate fns and leaves the dispatch
+ * to callers.
+ *
+ * When `hidden_recipients` is empty the call routes to the original
+ * non-hidden libtumpa entry points (matches the pre-0.4 behavior).
  */
-public func encrypt(plaintext: Data, recipients: [String], signerFingerprint: String?, armor: Bool, provider: SecretProvider?)throws  -> Data  {
+public func encrypt(plaintext: Data, recipients: [String], hiddenRecipients: [String], signerFingerprint: String?, armor: Bool, provider: SecretProvider?)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTumpaError_lift) {
     uniffi_tumpa_uniffi_fn_func_encrypt(
         FfiConverterData.lower(plaintext),
         FfiConverterSequenceString.lower(recipients),
+        FfiConverterSequenceString.lower(hiddenRecipients),
         FfiConverterOptionString.lower(signerFingerprint),
         FfiConverterBool.lower(armor),
         FfiConverterOptionTypeSecretProvider.lower(provider),$0
+    )
+})
+}
+/**
+ * Autocrypt-minimised transferable public key bytes for `fingerprint`
+ * scoped to `addr`. The caller base64-encodes (no line wrap) into the
+ * `keydata=` attribute of an outbound `Autocrypt:` header per
+ * <https://autocrypt.org/level1.html#openpgp-based-key-data>.
+ *
+ * Output is binary OpenPGP and contains only the primary key, one UID
+ * matching `addr` (case-insensitive), the subkey packets with their
+ * self-signatures, and the primary's own revocation / direct sigs.
+ * Third-party certifications and User Attribute packets are stripped
+ * — Autocrypt is per-address and rides on every outbound mail, so
+ * size discipline matters and third-party-cert leakage of the social
+ * graph would be unacceptable.
+ */
+public func exportAutocryptKeydata(fingerprint: String, addr: String)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTumpaError_lift) {
+    uniffi_tumpa_uniffi_fn_func_export_autocrypt_keydata(
+        FfiConverterString.lower(fingerprint),
+        FfiConverterString.lower(addr),$0
+    )
+})
+}
+/**
+ * ASCII-armored full transferable public key for `fingerprint`.
+ *
+ * Used by the Mail extension's "attach my public key when signing"
+ * feature, which embeds the bytes as an `application/pgp-keys` MIME
+ * part on outbound signed mail (Thunderbird convention,
+ * `OpenPGP_0x<long-keyid>.asc`). Unlike
+ * [`export_autocrypt_keydata`], the output here is the full cert —
+ * every UID, every subkey, all third-party certifications.
+ */
+public func exportPublicArmored(fingerprint: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeTumpaError_lift) {
+    uniffi_tumpa_uniffi_fn_func_export_public_armored(
+        FfiConverterString.lower(fingerprint),$0
+    )
+})
+}
+/**
+ * Every usable (non-revoked, non-expired) cert whose any UID carries
+ * `email`. Unlike [`resolve_recipients`], this returns ALL matches,
+ * not just the first — the host UI's per-address key picker and the
+ * `.appex`'s override-validation both need the full candidate set.
+ *
+ * The flat `KeyInfo` carries `is_secret` / `has_card` so the Swift
+ * side can filter to signable certs (signing needs secret material
+ * or a linked card) without a second round trip. `has_card` is
+ * populated from the same single `card_idents_map` query [`list_keys`]
+ * uses.
+ */
+public func keysForEmail(email: String)throws  -> [KeyInfo]  {
+    return try  FfiConverterSequenceTypeKeyInfo.lift(try rustCallWithError(FfiConverterTypeTumpaError_lift) {
+    uniffi_tumpa_uniffi_fn_func_keys_for_email(
+        FfiConverterString.lower(email),$0
     )
 })
 }
@@ -1925,6 +2010,11 @@ public func listKeys()throws  -> [KeyInfo]  {
  * only a revoked or expired cert renders as "unresolved" → red dot
  * in compose, never falls through to a confusing INV_RECP at send
  * time.
+ *
+ * When an address matches more than one usable cert this returns the
+ * FIRST match (keystore order). The host UI lets the user pin a
+ * per-address default via [`keys_for_email`] / [`ambiguous_addresses`];
+ * the `.appex` honors that pin before falling back here.
  */
 public func resolveRecipients(emails: [String])throws  -> [String: String]  {
     return try  FfiConverterDictionaryStringString.lift(try rustCallWithError(FfiConverterTypeTumpaError_lift) {
@@ -1985,19 +2075,31 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_tumpa_uniffi_checksum_func_ambiguous_addresses() != 51952) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_tumpa_uniffi_checksum_func_decrypt_and_verify() != 50047) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tumpa_uniffi_checksum_func_describe_key() != 54129) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tumpa_uniffi_checksum_func_encrypt() != 15976) {
+    if (uniffi_tumpa_uniffi_checksum_func_encrypt() != 7124) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tumpa_uniffi_checksum_func_export_autocrypt_keydata() != 21838) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tumpa_uniffi_checksum_func_export_public_armored() != 62680) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tumpa_uniffi_checksum_func_keys_for_email() != 32518) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tumpa_uniffi_checksum_func_list_keys() != 5263) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tumpa_uniffi_checksum_func_resolve_recipients() != 4786) {
+    if (uniffi_tumpa_uniffi_checksum_func_resolve_recipients() != 24311) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tumpa_uniffi_checksum_func_sign_detached() != 61228) {
