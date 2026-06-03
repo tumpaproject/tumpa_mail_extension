@@ -113,6 +113,25 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         }
     }
 
+    // MARK: - Content-keyed decode cache
+    //
+    // The UUID/Message-Id cache above only hits for messages WE encoded
+    // this session (the slot is populated at encode time). Re-opening an
+    // already-sent encrypted message in a fresh process — or any inbound
+    // encrypted message Mail re-renders / re-indexes — misses it and
+    // re-runs the full decrypt every time. For a large message (e.g. a
+    // 20 MB Sent copy with attachments) that means re-shipping the
+    // ciphertext over XPC, re-running the card + bulk symmetric decrypt,
+    // and re-shipping the plaintext back — multiple seconds per open.
+    //
+    // This cache keys the decoded result on a hash of the exact bytes
+    // Mail handed us, so repeated `decodedMessage(forMessageData:)` calls
+    // for the same message (the viewer, the standalone window, the
+    // library indexer) return instantly after the first decode. Bounded
+    // to a small entry count because each cached `MEDecodedMessage` can
+    // hold a multi-MB decrypted body; oldest entry is evicted on insert.
+    private let contentDecodedCache = BoundedContentCache<MEDecodedMessage>(capacity: 8)
+
     // The host app's Keys pane writes the user's default signing key
     // into the shared App Group `UserDefaults`. The .appex reads it
     // here. Both targets carry the
@@ -406,18 +425,42 @@ final class TumpaOutgoingSecurityHandler: NSObject, MEMessageSecurityHandler {
         guard PGPMimeParser.hasPGPMarkers(in: data) else {
             return nil
         }
+
+        // Content-keyed cache: re-opening the same encrypted/signed
+        // message (viewer, standalone window, library indexer) returns
+        // the already-decoded result instead of re-running the full
+        // decrypt — the big win for large Sent copies. Hash is computed
+        // only for PGP-marked messages, so non-PGP mail never pays it.
+        let hash = contentCacheKey(for: data)
+        if let cached = contentDecodedCache.value(forKey: hash) {
+            log.info("decodedMessage: content-cache hit (\(data.count)B)")
+            return cached
+        }
+
         let kind = PGPMimeParser.classify(data)
         switch kind {
         case .pgpEncrypted(let ciphertext):
             log.info("decodedMessage classified as encrypted ciphertext=\(ciphertext.count)B")
-            return decodeEncrypted(ciphertext: ciphertext, original: data)
+            // Zero-byte ciphertext can never decrypt. Bail before the
+            // XPC round-trip and the libtumpa software-key fan-out (each
+            // missing key otherwise triggers an agent prompt that can
+            // block for seconds).
+            guard !ciphertext.isEmpty else {
+                log.info("decodedMessage: empty ciphertext — returning nil")
+                return nil
+            }
+            let decoded = decodeEncrypted(ciphertext: ciphertext, original: data)
+            if let decoded { contentDecodedCache.insert(decoded, forKey: hash) }
+            return decoded
         case .pgpSigned(let signedPart, let signature, _):
             log.info("decodedMessage classified as signed signedBytes=\(signedPart.count)B sigBytes=\(signature.count)B")
-            return decodeSigned(
+            let decoded = decodeSigned(
                 signedEntity: signedPart,
                 signature: signature,
                 original: data
             )
+            if let decoded { contentDecodedCache.insert(decoded, forKey: hash) }
+            return decoded
         case .notPGP:
             log.info("decodedMessage classified as notPGP — returning nil")
             return nil
